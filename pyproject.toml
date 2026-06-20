@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ElemeNet"
+version = "0.1.0"
+description = "Machine learning workflows for structure-property prediction across the periodic table"
+readme = "README.md"
+requires-python = ">=3.10"
+
+authors = [
+    { name = "Jacob Toney", email = "jwt@mit.edu" },
+    { name = "Samir Darouich", email = "samir.darouich@ki.uni-stuttgart.de" }
+]
+
+dependencies = [
+    "pip>=22.3.1",
+    "numpy>=2.1.0",
+    "pandas>=2.2.3",
+    "tqdm>=4.66.1",
+    "scikit-learn>=1.6.1",
+    "jupyterlab>=1.1.1",
+    "molSimplify @ git+https://github.com/hjkgrp/molSimplify.git",
+    "optuna>=4.5.0",
+    "rdkit==2025.3.5",
+    "matplotlib>=3.7.3",
+    "seaborn>=0.13.2",
+    "umap-learn>=0.5.9",
+    "torch==2.8.0",
+    "torch_geometric==2.6.1",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+script-files = [
+    "src/scripts/elemenet_train",
+    "src/scripts/elemenet_inference",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

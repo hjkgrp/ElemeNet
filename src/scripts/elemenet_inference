@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+from elemenet.inference import inference_pipeline
+import argparse
+
+if __name__ == "__main__":
+    
+    p = argparse.ArgumentParser(description='Inference Script')
+    p.add_argument("--model_path", required=True, help="Path to the training folder")
+    p.add_argument("--new_data_path", required=True, help="Path to new data for inference")
+    p.add_argument("--mol_column", required=True, help="Name of the molecule column in new data")
+    p.add_argument("--target_column", required=False, default=None, type=str, help="Optional. Ground-truth column(s) in new data, comma-separated: 'x,y,z'. Only used to compute metrics and write *_true columns; omit for prediction-only inference on unlabelled data.")
+    p.add_argument("--graph_format", default="mol2", help="Graph format for new data (default: mol2)")
+    p.add_argument("--edge_invariant", action="store_true", help="Whether to use edge invariant representation")
+    p.add_argument("--batch_size", type=int, default=128, help="Batch size for inference (default: 128)")
+    p.add_argument("--save_dir", default="inference_results", help="Directory to save inference results")
+    p.add_argument("--device", default="cuda", help="Device for inference (default: cuda)")
+    
+    args = p.parse_args()
+    inference_pipeline(
+        model_path=args.model_path,
+        new_data_path=args.new_data_path,
+        mol_column=args.mol_column,
+        target_column=args.target_column.split(",") if args.target_column else None,
+        graph_format=args.graph_format,
+        save_dir=args.save_dir,
+        edge_invariant=args.edge_invariant,
+        batch_size=args.batch_size,
+        device=args.device,
+    )
