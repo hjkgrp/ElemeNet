@@ -101,6 +101,8 @@ def optimize(
     num_workers=0,
     random_seed=0,
     device=None,
+    grad_clip_norm=None,
+    max_grad_skips=0,
     _distributed=False,
 ):
     """
@@ -234,6 +236,8 @@ def optimize(
             scheduler_config=scheduler_config,
             device=device,
             process_group=trial_pg,
+            grad_clip_norm=grad_clip_norm,
+            max_grad_skips=max_grad_skips,
         )
 
         _old_sigabrt = signal.signal(signal.SIGABRT, _sigabrt_to_exception)
@@ -402,7 +406,8 @@ def optimize(
     return best_params
 
 
-def hypersearch_worker_loop(dataset, batch_size, num_workers, device):
+def hypersearch_worker_loop(dataset, batch_size, num_workers, device, grad_clip_norm=None,
+                            max_grad_skips=0):
     """
     Worker loop for non-main ranks during distributed hyperparameter optimization.
     Waits for trial signals from rank 0 and participates in each DDP training run,
@@ -440,6 +445,8 @@ def hypersearch_worker_loop(dataset, batch_size, num_workers, device):
                 scheduler_config=scheduler_config,
                 device=device,
                 process_group=trial_pg,
+                grad_clip_norm=grad_clip_norm,
+                max_grad_skips=max_grad_skips,
             )
             _old_sigabrt = signal.signal(signal.SIGABRT, _sigabrt_to_exception)
             try:
@@ -700,6 +707,18 @@ def search_space_encoder(trial, quicksearch=False, encoder_type="gnn", fixed=Non
                 lambda: trial.suggest_categorical(
                     "encoder_aggregation_method", ["sum", "mean"]
                 ))
+            trial_params["tanh"] = _maybe_suggest(trial, fixed, "tanh",
+                lambda: trial.suggest_categorical(
+                    "encoder_tanh", [True, False]
+                ))
+            # coords_range only affects the model when tanh bounding is on, so it
+            # is suggested conditionally — Optuna only explores it within tanh=True
+            # trials (and gets real val-loss signal from it there).
+            if trial_params["tanh"]:
+                trial_params["coords_range"] = _maybe_suggest(trial, fixed, "coords_range",
+                    lambda: trial.suggest_float(
+                        "encoder_coords_range", 1.0, 20.0
+                    ))
     return trial_params
 
 

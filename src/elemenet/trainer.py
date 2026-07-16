@@ -57,10 +57,21 @@ class Trainer:
     """
 
     def __init__(self, model_config, optimizer_config, loss_config,
-                 scheduler_config=None, device=None, process_group=None):
+                 scheduler_config=None, device=None, process_group=None,
+                 grad_clip_norm=None, max_grad_skips=0):
         self.model_config = model_config
         self.optimizer_config = optimizer_config
         self.loss_config = loss_config
+        # max global gradient norm for clipping after backward(); None disables
+        # clipping (preserves the original behaviour). Useful for stabilising
+        # heavy-tailed losses (e.g. Gaussian NLL) whose gradients can spike.
+        self.grad_clip_norm = grad_clip_norm
+        # if > 0, skip (rather than apply) an optimizer step whose loss/gradient
+        # is non-finite, up to this many CONSECUTIVE skips before aborting with a
+        # NaNLossError. 0 disables skipping (a non-finite step propagates and is
+        # caught by the end-of-epoch NaN check, preserving the original behaviour).
+        self.max_grad_skips = max_grad_skips
+        self._consec_grad_skips = 0
         self.scheduler_config = scheduler_config or {
             "scheduler_type": None, "scheduler_config": {},
         }
@@ -124,7 +135,7 @@ class Trainer:
             train_loader.sampler.set_epoch(epoch)
         model.train()
         running_loss = 0
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             batch = batch.to(self.device)
             optimizer.zero_grad()
             # call the model
@@ -133,7 +144,34 @@ class Trainer:
             loss = loss_fn(outputs)
             # backpropagation and optimization step
             loss.backward()
+            if self.grad_clip_norm is not None:
+                # clip_grad_norm_ returns the (pre-clip) total norm; non-finite here
+                # means a non-finite gradient that clipping cannot sanitise.
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), self.grad_clip_norm
+                )
+                step_is_finite = bool(torch.isfinite(total_norm))
+            else:
+                step_is_finite = bool(torch.isfinite(loss))
+            # optionally skip a non-finite step instead of writing NaN/Inf into the
+            # weights; abort after max_grad_skips consecutive skips.
+            if not step_is_finite and self.max_grad_skips > 0:
+                self._consec_grad_skips += 1
+                if self.is_main:
+                    print(
+                        f"  [skip {self._consec_grad_skips}/{self.max_grad_skips}] "
+                        f"non-finite loss/gradient at epoch {epoch}, batch {batch_idx} "
+                        f"— skipping optimizer step",
+                        flush=True,
+                    )
+                if self._consec_grad_skips >= self.max_grad_skips:
+                    raise NaNLossError(
+                        f"{self._consec_grad_skips} consecutive non-finite gradient "
+                        f"steps (max_grad_skips={self.max_grad_skips}) at epoch {epoch}"
+                    )
+                continue  # weights untouched; grads cleared by next zero_grad()
             optimizer.step()
+            self._consec_grad_skips = 0
             if scheduler is not None:
                 scheduler.step_batch()
             running_loss += loss.item()

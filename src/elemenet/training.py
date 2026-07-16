@@ -69,6 +69,8 @@ def training_pipeline(
     implicit_Hs=False,
     rdkit_features=False,
     save_embeddings=True,
+    grad_clip_norm=None,
+    max_grad_skips=0,
 ):
     """End-to-end training pipeline: preprocess, (optionally) hyperparameter-search, train, and evaluate.
 
@@ -386,6 +388,8 @@ def training_pipeline(
                 num_workers=num_workers,
                 random_seed=random_seed,
                 device=device,
+                grad_clip_norm=grad_clip_norm,
+                max_grad_skips=max_grad_skips,
                 _distributed=_distributed,
             )
         else:
@@ -394,6 +398,8 @@ def training_pipeline(
                 batch_size=batch_size,
                 num_workers=num_workers,
                 device=device,
+                grad_clip_norm=grad_clip_norm,
+                max_grad_skips=max_grad_skips,
             )
         if _distributed:
             objects = [fixed_params if _is_main else None]
@@ -416,6 +422,8 @@ def training_pipeline(
         optimizer_config=optimizer_config,
         scheduler_config=scheduler_config,
         device=device,
+        grad_clip_norm=grad_clip_norm,
+        max_grad_skips=max_grad_skips,
     )
 
     result = trainer.train(

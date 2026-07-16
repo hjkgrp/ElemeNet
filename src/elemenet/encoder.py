@@ -93,6 +93,11 @@ class EGNNConfig:
         Aggregation strategy: ``'sum'`` or ``'mean'``. Default ``'sum'``.
     num_gaussians : int
         Number of Gaussian basis functions for distance embedding. Default 64.
+    use_norm : bool
+        Apply LayerNorm to the (invariant) node features after each equivariant
+        block. Bounds the node-feature residual stream so it cannot compound to
+        fp32 overflow in deep stacks. Coordinate-features are never normalized
+        (that would break E(3) equivariance). Default False.
     """
 
     input_size: int
@@ -110,6 +115,7 @@ class EGNNConfig:
     normalization_factor: float = 100
     aggregation_method: str = "sum"
     num_gaussians: int = 64
+    use_norm: bool = False
 
 
 class GNN_Encoder(nn.Module):
@@ -329,6 +335,7 @@ class EGNN_Encoder(nn.Module):
         normalization_factor=100,
         aggregation_method="sum",
         num_gaussians=64,
+        use_norm=False,
         dropouts=None,
         **kwargs,
     ):
@@ -374,6 +381,14 @@ class EGNN_Encoder(nn.Module):
 
         self.embedding = nn.Linear(input_size, hidden_size)
         self.embedding_out = nn.Linear(hidden_size, out_node_nf)
+        # optional LayerNorm on the invariant node features after each block;
+        # bounds the residual stream so |h| cannot compound to fp32 overflow.
+        self.use_norm = use_norm
+        self.h_norms = (
+            nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(n_layers)])
+            if use_norm
+            else None
+        )
         self.dropouts = nn.ModuleList()
         for i in range(0, n_layers):
             self.add_module(
@@ -427,6 +442,10 @@ class EGNN_Encoder(nn.Module):
                 h, x, edge_index, node_mask=None, edge_mask=None, edge_attr=edge_attr
             )
             h = self.dropouts[i](h)
+            # normalize only the invariant node features h; never the coordinate
+            # features x (LayerNorm on x would break E(3) equivariance).
+            if self.use_norm:
+                h = self.h_norms[i](h)
 
         # Important, the bias of the last linear might be non-zero
         h = self.embedding_out(h)

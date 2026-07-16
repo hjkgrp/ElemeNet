@@ -111,6 +111,12 @@ def build_encoder_config(encoder_type: str, params: dict):
             aggregation_method=encoder_config.get("aggregation_method", "sum"),
             num_gaussians=encoder_config.get("num_gaussians", 64),
             inv_sublayers=encoder_config.get("inv_sublayers", 2),
+            # tanh bounds equivariant coordinate updates (|update| <= coords_range),
+            # preventing the unbounded coord/distance feedback that can blow EGNN
+            # activations up to fp32 overflow. Defaults preserve prior behaviour.
+            tanh=encoder_config.get("tanh", False),
+            coords_range=encoder_config.get("coords_range", 15),
+            use_norm=encoder_config.get("use_norm", False),
         )
 
 
@@ -258,6 +264,9 @@ def invert_encoder_config(config_obj, encoder_type: str):
         encoder_config["aggregation_method"] = cfg.get("aggregation_method", "sum")
         encoder_config["num_gaussians"] = cfg.get("num_gaussians", 64)
         encoder_config["inv_sublayers"] = cfg.get("inv_sublayers", 2)
+        encoder_config["tanh"] = cfg.get("tanh", False)
+        encoder_config["coords_range"] = cfg.get("coords_range", 15)
+        encoder_config["use_norm"] = cfg.get("use_norm", False)
 
     return {
         "encoder_type": encoder_type,
