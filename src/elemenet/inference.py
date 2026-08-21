@@ -44,6 +44,31 @@ def _patch_legacy_mlp_attrs(module, scope):
             setattr(module, attr, default)
 
 
+def _patch_legacy_encoder_attrs(encoder):
+    """Backfill encoder attributes added after some checkpoints were pickled.
+
+    Same rationale as ``_patch_legacy_mlp_attrs``, for the encoder side. Each
+    entry is applied only when the attribute is genuinely absent, so encoders
+    built by the current code are untouched and default behaviour is unchanged.
+
+    ``use_norm`` / ``h_norms`` were added to ``EGNN_Encoder`` to optionally
+    LayerNorm the invariant node features. ``EGNN_Encoder.forward`` reads
+    ``self.use_norm`` unconditionally, so a checkpoint pickled before the flag
+    existed raises ``AttributeError`` on every forward pass. ``False``/``None``
+    reproduces how those models were actually trained: no normalization was
+    applied because the code path did not exist.
+
+    Note this is only needed for the pickled-instance path used here. Resuming
+    or seeding training (``training.py``) rebuilds the encoder from
+    ``model_config`` with the current class, so it already has these fields.
+    """
+    if encoder is None:
+        return
+    for attr, default in (("use_norm", False), ("h_norms", None)):
+        if not hasattr(encoder, attr):
+            setattr(encoder, attr, default)
+
+
 def _backfill_legacy_model_attrs(model, train_args):
     """Set sensible defaults for attributes that newer ElemeNet code expects on
     readout / encoder modules but that older saved checkpoints don't have.
@@ -59,6 +84,10 @@ def _backfill_legacy_model_attrs(model, train_args):
     those models already have these attributes.
     """
     scope = train_args["model_config"].get("scope", "graph")
+
+    # patch the encoder before the early return below — a model can have an
+    # encoder needing repair whether or not its readout does.
+    _patch_legacy_encoder_attrs(getattr(model, "encoder", None))
 
     readout = getattr(model, "readout", None)
     if readout is None:
