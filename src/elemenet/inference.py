@@ -242,9 +242,12 @@ def inference_pipeline(
     # create dataloader
     test_loader = dataset.test_dataloader(batch_size=batch_size, num_workers=0)
 
-    # define loss — loss_type may be at top level (old checkpoints) or in model_config (new)
-    if "loss_type" not in train_args:
-        train_args["loss_type"] = train_args["model_config"]["loss_type"]
+    # define loss — these may be at top level (old checkpoints) or in model_config (new).
+    # sigma_min must be hoisted too, or a model trained with a raised floor is
+    # re-scored at the default and its reported NLL will not match training.
+    for key in ("loss_type", "sigma_min"):
+        if key not in train_args and key in train_args.get("model_config", {}):
+            train_args[key] = train_args["model_config"][key]
     loss_config = extract_loss_config(params=train_args)
     loss_fn = build_loss_fn(**loss_config)
 

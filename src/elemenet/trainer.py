@@ -790,17 +790,26 @@ class Ensemble_regression:
     reduction : str, optional
         Reduction method: ``'mean'``, ``'sum'``, or ``'none'``. Default
         ``'mean'``.
+    sigma_min : float, optional
+        Smallest standard deviation the ensemble may claim, in units of the
+        standardized target. Bounds the residual term at ``r**2 / sigma_min**2``,
+        which is what keeps targets with a deterministic subpopulation (e.g. the
+        symmetry-enforced zero dipole of a centrosymmetric complex) from
+        collapsing the spread and diverging. Default ``1e-3``, reproducing the
+        historical variance clamp of ``1e-6``.
     """
 
-    def __init__(self, reduction="mean", **kwargs):
+    def __init__(self, reduction="mean", sigma_min=1e-3, **kwargs):
         assert reduction in ["mean", "sum", "none"], (
             f"Unknown reduction type: '{reduction}'"
             " (choose from 'mean', 'sum', or 'none')"
         )
+        assert sigma_min > 0, f"sigma_min must be positive, got {sigma_min}"
         self.reduction = reduction
+        self.sigma_min = sigma_min
 
     def __call__(self, prediction, target, uncertainty):
-        variance = torch.clip(torch.square(uncertainty), min=1e-6)
+        variance = torch.clip(torch.square(uncertainty), min=self.sigma_min**2)
         l1 = torch.log(variance)
         l2 = nn.functional.mse_loss(prediction, target, reduction="none") / variance
         nll = 0.5 * (l1 + l2)
@@ -1052,6 +1061,11 @@ def extract_loss_config(params):
         return {
             "loss_type": loss_type,
             "class_weight": params.get("class_weight", None),
+        }
+    elif loss_type == "ensemble_regression":
+        return {
+            "loss_type": loss_type,
+            "sigma_min": params.get("sigma_min", 1e-3),
         }
     else:
         return {"loss_type": loss_type}
