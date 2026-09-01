@@ -204,7 +204,6 @@ def inference_pipeline(
         target_column=target_column,
         task=train_args["task"],
         feature_columns=train_args["feature_columns"],
-        representation="learned",
         graph_format=graph_format,
         train_val_test_split=None,
         data_path=data_path,

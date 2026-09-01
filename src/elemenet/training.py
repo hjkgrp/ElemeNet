@@ -293,6 +293,7 @@ def training_pipeline(
             {
                 "mol_column": mol_column,
                 "target_column": target_column,
+                "label_column": label_column,
                 "task": task,
                 "data_path": data_path,
                 "graph_format": graph_format,

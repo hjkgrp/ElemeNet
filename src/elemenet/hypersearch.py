@@ -769,9 +769,14 @@ def search_space(trial, encoder_type, readout_type, scope, quicksearch=False, fi
         "scope": scope,
     }
 
-    trial_params["encoder_config"] = search_space_encoder(
-        trial, quicksearch=quicksearch, encoder_type=encoder_type, fixed=fixed_encoder
-    )
+    if encoder_type is None:
+        # encoder-free (tabular) model: there is no encoder to tune, so none of
+        # its dimensions are suggested and no trial budget is spent on them.
+        trial_params["encoder_config"] = {}
+    else:
+        trial_params["encoder_config"] = search_space_encoder(
+            trial, quicksearch=quicksearch, encoder_type=encoder_type, fixed=fixed_encoder
+        )
 
     trial_params["readout_config"] = search_space_readout(
         trial, quicksearch=quicksearch, readout_type=readout_type, scope=scope, fixed=fixed_readout

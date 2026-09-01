@@ -2,7 +2,10 @@ from typing import Optional
 from elemenet.preprocess import (
     drop_invalid_smiles,
     featurize,
+    get_extra_features,
     get_split,
+    load_tabular_features,
+    scale_and_encode_user_features,
     mol_to_graph,
     scale,
     validate_inputs,
@@ -60,10 +63,9 @@ class DataModule:
         target_column,
         task,
         data_path=os.getcwd(),
-        representation="learned",
-        depth=4,
+        feature_data_path=None,
+        label_column=None,
         center_columns=None,
-        prefix="",
         feature_columns=None,
         graph_format="mol2",
         train_val_test_split=None,
@@ -89,18 +91,33 @@ class DataModule:
             data_path: str
                 Directory where results are saved.
                 default=current working directory
-            representation: str
-                Representation scheme to use, either RACs for an MLP or a learned representation for a GNN.
-                default='learned'
-            depth: int
-                Maximum depth of graph searched when generating RACs.
-                default=4
-            center_columns: list
-                Columns containing particularly relevant atoms upon which to center RACs.
+            feature_data_path: list or None
+                Paths to CSVs of precomputed features, ordered [train, val, test],
+                for encoder-free models (``encoder_type=None``). When supplied, no
+                molecular graph is built: features come from these files while
+                targets and node/edge/graph attributes still come from
+                ``raw_data_path``.
+
+                IMPORTANT — rows are matched BY POSITION, not by joining on a key.
+                Each feature file must contain exactly the same samples, in exactly
+                the same order, as the corresponding ``raw_data_path`` split, one
+                row each. ``label_column`` is compared elementwise between the two
+                files and a mismatch raises rather than training on misaligned
+                targets, but that check only catches disagreements it can see — keep
+                the files in sync at the source.
+
+                Every column is used as a feature except ``label_column`` and any
+                column named in ``feature_columns`` (those are injected separately
+                as graph attributes). Features must be numeric and finite.
                 default=None
-            prefix: str
-                Optional prefix for RACs features. Useful when generating multiple RACs vectors for single prediction task.
-                default=''
+            label_column: str or None
+                Identifier column (e.g. refcode) present in both ``raw_data_path``
+                and ``feature_data_path``. Required when ``feature_data_path`` is
+                given, so the positional alignment above can be verified.
+                default=None
+            center_columns: list
+                Columns containing particularly relevant atoms upon which to center subgraphs.
+                default=None
             feature_columns: list
                 Columns containing extra features to process and return.
                 default=None
@@ -122,11 +139,10 @@ class DataModule:
                 default=0
         """
         # validate inputs
-        presplit, task, representation, center_columns, graph_format, drop_indices = (
+        presplit, task, center_columns, graph_format, drop_indices = (
             validate_inputs(
                 raw_data_path,
                 task,
-                representation,
                 center_columns,
                 graph_format,
                 mol_column,
@@ -154,16 +170,45 @@ class DataModule:
         # multiple splits (e.g. inference passes one file as all three). Lets
         # get_processed_features skip rebuilding graphs for duplicated splits.
         self._split_source_map = [0, 1, 2]
-        if not presplit:
+        if feature_data_path is not None:
+            # encoder-free (tabular) models: features come from user-supplied CSVs
+            # instead of being derived from molecular graphs, so no molecule is
+            # parsed here. Targets and graph attributes still come from
+            # raw_data_path; the feature files are matched to it by row order.
+            if not presplit or len(feature_data_path) != 3:
+                raise ValueError(
+                    "feature_data_path must be a list of three CSVs ordered as "
+                    "[train, val, test], matching a presplit raw_data_path."
+                )
+            target_cols = (
+                [target_column] if isinstance(target_column, str) else list(target_column or [])
+            )
+            X_splits, y_splits, extra_features_splits = [], [], []
+            for feat_path, raw_path in zip(feature_data_path, raw_data_path):
+                X_splits.append(
+                    load_tabular_features(
+                        feat_path, raw_path, label_column, feature_columns
+                    )
+                )
+                keep = [label_column] + [c for c in target_cols if c != label_column]
+                raw = pd.concat(
+                    pd.read_csv(raw_path, chunksize=20000), ignore_index=True
+                )
+                y_splits.append(raw[[c for c in keep if c in raw.columns]].copy())
+                extra = get_extra_features(data=raw, feature_columns=feature_columns)
+                extra, _ = scale_and_encode_user_features(extra)
+                extra_features_splits.append(extra)
+            print(
+                f"Loaded precomputed features: {X_splits[0].shape[1]} columns, "
+                f"{[len(x) for x in X_splits]} rows per split."
+            )
+        elif not presplit:
             # featurize
             X_data, y_data, extra_features = featurize(
                 data_path=raw_data_path,
                 mol_column=mol_column,
                 save_dir=data_path,
-                representation=representation,
-                depth=depth,
                 center_columns=center_columns,
-                prefix=prefix,
                 feature_columns=feature_columns,
                 graph_format=graph_format,
             )
@@ -205,10 +250,7 @@ class DataModule:
                         data_path=data_split,
                         mol_column=mol_column,
                         save_dir=data_path,
-                        representation=representation,
-                        depth=depth,
                         center_columns=center_columns,
-                        prefix=prefix,
                         feature_columns=feature_columns,
                         graph_format=graph_format,
                     )
@@ -234,7 +276,7 @@ class DataModule:
             X_splits,
             y_splits,
             target_column=target_column,
-            representation=representation,
+            scale_features=feature_data_path is not None,
             scale=(task == "regression") and (target_column is not None),
             save_dir=data_path,
             y_scaler=y_scaler,
@@ -532,7 +574,7 @@ class DataModule:
             feature_desc = (
                 "Processing features" if single_source else f"Processing {split} features"
             )
-            if encoder_type == "mlp":
+            if encoder_type is None:
                 default_path = os.path.join(data_path, "X_data", "X_" + split + ".pkl")
                 scaled_path = os.path.join(
                     data_path, "X_data", "X_" + split + "_scaled.pkl"
@@ -540,15 +582,33 @@ class DataModule:
                 features_path = (
                     scaled_path if os.path.exists(scaled_path) else default_path
                 )
-                features = pd.read_pickle(features_path).values
+                features = torch.tensor(
+                    pd.read_pickle(features_path).to_numpy(dtype="float32")
+                )
+                # graph-level attributes (charge, spinmult, ...) are injected the
+                # same way as for graph models, so feature_columns keeps working
+                graph_attr = None
+                if feature_columns:
+                    graph_path = os.path.join(
+                        data_path, "X_data", f"extra_graph_features_{split}.pkl"
+                    )
+                    if os.path.exists(graph_path):
+                        graph_attr = torch.tensor(
+                            pd.read_pickle(graph_path).to_numpy(dtype="float32")
+                        )
+                        if len(graph_attr) != len(features):
+                            raise ValueError(
+                                f"{split}: {len(graph_attr)} graph-attribute rows for "
+                                f"{len(features)} feature rows."
+                            )
                 data_ = []
-                for x in tqdm(
-                    features,
-                    total=len(features),
-                    desc=feature_desc,
-                ):
-                    x = x.unsqueeze(1) if x.ndim == 1 else x
-                    data_.append(Data(x=x))
+                for i in tqdm(range(len(features)), total=len(features), desc=feature_desc):
+                    # one sample per row: x is (1, n_features) so batching yields
+                    # (batch_size, n_features) with no pooling required
+                    d = Data(x=features[i].unsqueeze(0))
+                    if graph_attr is not None:
+                        d.graph_attr = graph_attr[i].unsqueeze(0)
+                    data_.append(d)
             elif encoder_type in ["gnn", "egnn"]:
                 mols = pd.read_pickle(
                     os.path.join(data_path, "X_data", f"X_{split}.pkl")
@@ -626,7 +686,7 @@ class DataModule:
                         )
                     )
             X_splits.append(data_)
-            if feature_columns:
+            if feature_columns and encoder_type in ("gnn", "egnn"):
                 if not extra_features["node"].empty:
                     print(
                         f"Included extra node features: {list(extra_features['node'].columns)}"
@@ -831,7 +891,8 @@ class DataModule:
         max_num_edges = 0
         for split in self.graphs_splits:
             for graph in split:
-                num_edges = graph.edge_index.shape[1]
+                edge_index = getattr(graph, "edge_index", None)
+                num_edges = 0 if edge_index is None else edge_index.shape[1]
                 if num_edges > max_num_edges:
                     max_num_edges = num_edges
         return max_num_edges
@@ -857,7 +918,8 @@ class DataModule:
         X_train = self.graphs_splits[0][0]
         mlp_input_size = X_train.x.shape[1]  # set mlp input size to node feature size
         gnn_input_size = X_train.x.shape[1]  # set gnn input size to node feature size
-        edge_dim = X_train.edge_attr.shape[1]
+        edge_attr = getattr(X_train, "edge_attr", None)
+        edge_dim = edge_attr.shape[1] if edge_attr is not None else 0
         graph_attr = getattr(X_train, "graph_attr", None)
         graph_attr_dim = graph_attr.shape[1] if graph_attr is not None else 0
         if self.task == "regression":

@@ -60,8 +60,16 @@ def build_encoder_config(encoder_type: str, params: dict):
     GNNConfig or EGNNConfig
     """
     if encoder_type not in ENCODER_CONFIG_MAP:
+        hint = (
+            " For an encoder-free model that feeds precomputed features straight "
+            "to the readout, set encoder_type=None (not 'mlp') and supply "
+            "feature_data_path in preprocessing_kwargs."
+            if encoder_type == "mlp"
+            else ""
+        )
         raise ValueError(
-            f"Unknown encoder type '{encoder_type}'. Expected one of {list(ENCODER_CONFIG_MAP.keys())}."
+            f"Unknown encoder type '{encoder_type}'. Expected one of "
+            f"{list(ENCODER_CONFIG_MAP.keys())}, or None for no encoder.{hint}"
         )
 
     # get encoder settings
@@ -546,11 +554,17 @@ def extract_model_config(params):
     # get readout settings
     readout_config = build_readout_config(readout_type, params)
 
-    # optional get GNN encoder settings
-    encoder_config = build_encoder_config(encoder_type, params)
+    if encoder_type is None:
+        # encoder-free (tabular) model: the readout consumes precomputed features
+        # directly, so input_size stays as inferred from the feature table rather
+        # than being overwritten by an encoder's output width.
+        encoder_config = None
+    else:
+        # optional get GNN encoder settings
+        encoder_config = build_encoder_config(encoder_type, params)
 
-    # readout input = encoder output
-    readout_config.input_size = encoder_config.hidden_sizes[-1]
+        # readout input = encoder output
+        readout_config.input_size = encoder_config.hidden_sizes[-1]
 
     return {
         "scope": scope,
@@ -579,9 +593,11 @@ def build_model(
 
     Parameters
     ----------
-    encoder_type : str
-        Encoder architecture: ``'gnn'`` or ``'egnn'``. Pass ``None`` for a
-        pure MLP model (no encoder).
+    encoder_type : str or None
+        Encoder architecture: ``'gnn'`` or ``'egnn'``. Pass ``None`` for an
+        encoder-free model that feeds precomputed features straight to the
+        readout — useful as a tabular baseline. Encoder-free models require
+        ``scope='graph'`` and ``readout_type='mlp'``; both are enforced below.
     scope : str
         Prediction granularity: ``'graph'``, ``'node'``, or ``'edge'``.
     readout_config : MLPConfig, EdgePredictorConfig, or TransformerConfig
@@ -607,10 +623,29 @@ def build_model(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if scope == "edge" and encoder_type is None:
+    if encoder_type is None and scope != "graph":
+        detail = (
+            "there are no per-atom embeddings to predict from"
+            if scope == "node"
+            else "there is no bond structure to predict on"
+        )
         raise ValueError(
-            "Edge-level prediction (scope='edge') requires a graph encoder "
-            "(encoder_type='gnn' or 'egnn'). A pure MLP encoder has no edge structure."
+            f"Encoder-free models (encoder_type=None) support scope='graph' only, "
+            f"got scope='{scope}'. Precomputed features supply exactly one feature "
+            f"vector per sample, so {detail}. Either set scope='graph' to predict "
+            f"one value per sample, or use a graph encoder (encoder_type='gnn' or "
+            f"'egnn') if you need {scope}-level targets."
+        )
+
+    if encoder_type is None and readout_type != "mlp":
+        raise ValueError(
+            f"Encoder-free models (encoder_type=None) support readout_type='mlp' "
+            f"only, got readout_type='{readout_type}'. The transformer readout "
+            "attends over the nodes of a graph, but precomputed features give one "
+            "vector per sample, so the sequence length is 1 and attention is a "
+            "no-op — the model would silently become an MLP carrying unused "
+            "attention parameters. Use readout_type='mlp' for a tabular baseline, "
+            "or a graph encoder if you want a genuine transformer."
         )
 
     if encoder_type is None:
@@ -749,7 +784,10 @@ class Model(nn.Module):
                 # for node-level prediction, restrict output to subgraph nodes if defined
                 x, batch = self.subselect_node_embeddings(x, data)
         else:
-            x, embeddings = data, data
+            # encoder-free (tabular) model: each sample carries a single feature
+            # row, so the batched x is already (batch_size, n_features) and needs
+            # no pooling — pool_fn stays None.
+            x, embeddings = data.x, data.x
 
         # extract graph-level attributes for concatenation after pooling
         graph_attr = getattr(data, "graph_attr", None)

@@ -78,11 +78,12 @@ class Trainer:
 
         # save clean model_config which is used to set up the advanced model config
         self.clean_model_config = model_config.copy()
-        self.clean_model_config.update(
-            invert_encoder_config(
-                model_config["encoder_config"], model_config["encoder_type"]
+        if model_config.get("encoder_type") is not None:
+            self.clean_model_config.update(
+                invert_encoder_config(
+                    model_config["encoder_config"], model_config["encoder_type"]
+                )
             )
-        )
         self.clean_model_config.update(
             invert_readout_config(
                 model_config["readout_config"], model_config["readout_type"]
@@ -322,7 +323,7 @@ class Trainer:
 
         if self.is_main:
             print(
-                f"Training {self.model_config['encoder_type'].upper()} model with "
+                f"Training {(self.model_config['encoder_type'] or 'encoder-free').upper()} model with "
                 f"{sum(param.numel() for param in model.parameters())} parameters"
             )
             print(f"Using device: {self.device}"

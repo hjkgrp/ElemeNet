@@ -33,164 +33,10 @@ from torch_geometric.data import Data
 from typing import Optional
 
 
-def get_mol3D(data, mol_column, graph_format="mol2"):
-    """
-    Helper function to streamline generation of mol3D objects.
-    INPUTS:
-        data: DataFrame
-            Data containing molecular graphs and other associated properties.
-        mol_column: str
-            Column of data containing molecular graphs.
-        graph_format: str
-            Format of molecular graph. Supported types are 'mol2', 'xyz', 'smiles', 'mol', and 'sdf'.
-            default='mol2'
-    OUTPUTS:
-        mols: list
-            List of mol3D objects.
-    """
-
-    def molsimplify_mol2(mol_string):
-        mol3d = mol3D()
-        mol3d.readfrommol2(filename=mol_string, readstring=True)
-        check_deuterated(mol3d)
-        return mol3d
-
-    def molsimplify_xyz(mol_string):
-        mol3d = mol3D()
-        mol3d.readfromxyz(filename=mol_string, readstring=True)
-        mol3d.convert2OBMol()
-        mol3d.graph = mol3d.populateBOMatrix(bonddict=True)
-        mol3d.bo_graph_trun = mol3d.graph
-        check_deuterated(mol3d)
-        return mol3d
-
-    def molsimplify_smiles(mol_string):
-        mol3d = mol3D()
-        mol3d.read_smiles(smiles=mol_string)
-        mol3d.convert2OBMol()
-        mol3d.graph = mol3d.populateBOMatrix(bonddict=True)
-        mol3d.bo_graph_trun = mol3d.graph
-        check_deuterated(mol3d)
-        return mol3d
-
-    def check_deuterated(mol3d):
-        if "D" in mol3d.symvect():
-            print("Warning: deuterium present in molecule, treating as hydrogen")
-            atoms = mol3d.atoms
-            natoms = mol3d.natoms
-            [atoms[idx].mutate("H") for idx in range(natoms) if atoms[idx].sym == "D"]
-        return
-
-    parsers = {
-        "mol2": molsimplify_mol2,
-        "xyz": molsimplify_xyz,
-        "smiles": molsimplify_smiles,
-    }
-
-    assert graph_format in (
-        "mol2",
-        "xyz",
-        "smiles",
-    ), "only mol2, xyz, and smiles formats supported for RACs MLP models"
-
-    mols = [
-        parsers[graph_format](mol_string=mol_string) for mol_string in data[mol_column]
-    ]
-
-    return mols
-
-
-def get_racs(data, mols, save_dir, depth=4, center_columns=None, prefix=""):
-    """
-    Generate revised autocorrelations (RACs) features from molecular graph inputs.
-    INPUTS:
-        data: DataFrame
-            Data containing molecular graphs and other associated properties.
-        mols: list
-            List of mol3D objects.
-        save_dir: str
-            Directory where results are saved.
-        depth: int
-            Maximum depth of graph searched when generating RACs.
-            default=4
-        center_columns: list
-            Columns containing zero-indexed atom indices upon which to center RACs vectors. If None, RACs vectors are generated across every atom and averaged.
-            default=None
-        prefix: str
-            Optional prefix for RACs features. Useful when generating multiple RACs vectors for single prediction task.
-            default=''
-    OUTPUTS:
-        racs_data: DataFrame
-            DataFrame containing RACs for all input molecular graphs.
-        data: DataFrame
-            DataFrame containing original provided dataset.
-    """
-    racs_list = []
-    colnames = None
-    for idx, mol in enumerate(mols):
-        # generate racs
-        all_racs = []
-        all_colnames = []
-        if center_columns:
-            # generate product racs centered on specific atoms
-            for column in center_columns:
-                if column not in data.columns:
-                    raise ValueError(f"Column '{column}' not in dataset")
-                center_idx = int(data[column][idx])
-                racs_product = generate_atomonly_autocorrelations(
-                    mol=mol, atomIdx=center_idx, depth=depth, oct=False
-                )
-                # generate delta racs centered on specific atoms
-                racs_delta = generate_atomonly_deltametrics(
-                    mol=mol, atomIdx=center_idx, depth=depth, oct=False
-                )
-                # combine product and delta vectors
-                racs_product_flattened = [
-                    item for sublist in racs_product["results"] for item in sublist
-                ]
-                racs_delta_flattened = [
-                    item for sublist in racs_delta["results"] for item in sublist
-                ]
-                all_racs.extend(racs_product_flattened + racs_delta_flattened)
-                # name column so they are distinguishable
-                if not colnames:
-                    colnames_product = [
-                        f"{prefix}product_{item}_{column}"
-                        for sublist in racs_product["colnames"]
-                        for item in sublist
-                    ]
-                    colnames_delta = [
-                        f"{prefix}delta_{item}_{column}"
-                        for sublist in racs_delta["colnames"]
-                        for item in sublist
-                    ]
-                    all_colnames.extend(colnames_product + colnames_delta)
-
-        else:
-            # generate full complex racs averaged across the entire graph
-            racs = generate_full_complex_autocorrelations(
-                mol=mol, depth=depth, oct=False
-            )
-            all_racs = [item for sublist in racs["results"] for item in sublist]
-            # name columns
-            all_colnames = [
-                prefix + item for sublist in racs["colnames"] for item in sublist
-            ]
-
-        racs_list.append(all_racs)
-        if not colnames:
-            colnames = all_colnames
-
-    racs_data = pd.DataFrame(racs_list, columns=colnames)
-    os.makedirs(save_dir, exist_ok=True)
-    print(f"Length of generated RACs feature vector: {racs_data.shape[1]}")
-    return racs_data
-
-
 def get_extra_features(data, feature_columns):
     """
     Processes additional features provided by user.
-    Assumes all features are graph-level unless otherwise specified. Node and edge-level features are only defined for GNNs (i.e., representation=='learned').
+    Assumes all features are graph-level unless otherwise specified. Node and edge-level features are only defined for graph encoders.
     INPUTS:
         data: DataFrame
             Data containing molecular graphs and other associated properties.
@@ -442,19 +288,129 @@ def scale_and_encode_user_features(extra_features_dict):
     return extra_features_dict, scalers_dict
 
 
+def load_tabular_features(feature_path, raw_path, label_column, feature_columns=None):
+    """Load a precomputed feature table and align it to its raw-data split.
+
+    Used by encoder-free (tabular) models, where features come from a user-supplied
+    CSV instead of being derived from a molecular graph.
+
+    ROW-ORDER CONTRACT: ``feature_path`` and ``raw_path`` are matched BY POSITION.
+    Row *i* of the feature file is assumed to describe the same sample as row *i*
+    of the raw split; the files are never joined on a key. Both must therefore
+    contain the same samples, in the same order, one row each. ``label_column`` is
+    compared elementwise as a guard, so a re-ordered, truncated, or unrelated file
+    raises instead of silently pairing features with the wrong targets.
+
+    Every column is treated as a feature except ``label_column`` and any column
+    named in ``feature_columns`` (those are injected separately as graph
+    attributes, so including them here would duplicate them).
+
+    Parameters
+    ----------
+    feature_path : str
+        CSV of precomputed features for one split.
+    raw_path : str
+        The corresponding split of ``raw_data_path``, used for alignment checks.
+    label_column : str
+        Identifier column present in both files.
+    feature_columns : dict or list or None
+        Columns already supplied to the model as node/edge/graph attributes.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Numeric feature matrix, indexed like the raw split.
+    """
+    features = pd.read_csv(feature_path)
+    if label_column is None:
+        raise ValueError(
+            "label_column is required when using precomputed features so that the "
+            "feature table can be verified against the raw data."
+        )
+    if label_column not in features.columns:
+        raise ValueError(
+            f"label_column '{label_column}' not found in feature file '{feature_path}'."
+        )
+    labels = pd.concat(
+        pd.read_csv(raw_path, usecols=[label_column], chunksize=20000), ignore_index=True
+    )[label_column]
+    if len(features) != len(labels):
+        raise ValueError(
+            f"Row-count mismatch between precomputed features and raw data.\n"
+            f"  features : {len(features):>9,} rows  ({feature_path})\n"
+            f"  raw data : {len(labels):>9,} rows  ({raw_path})\n"
+            "Precomputed features are matched to the raw data BY ROW ORDER, not by "
+            "joining on a key, so the two files must contain the same samples in the "
+            "same order, one row each."
+        )
+    mismatch = features[label_column].to_numpy() != labels.to_numpy()
+    if mismatch.any():
+        first = int(mismatch.argmax())
+        n_bad = int(mismatch.sum())
+        same_set = set(features[label_column]) == set(labels)
+        cause = (
+            "The two files contain the same samples but in a different order — "
+            "re-sort the feature file to match the raw data."
+            if same_set
+            else "The two files do not contain the same samples."
+        )
+        raise ValueError(
+            f"Precomputed features are not row-aligned with the raw data "
+            f"({n_bad:,} of {len(labels):,} rows disagree).\n"
+            f"  first mismatch at row {first}:\n"
+            f"    features '{feature_path}' has {label_column}="
+            f"'{features[label_column].iloc[first]}'\n"
+            f"    raw data '{raw_path}' has {label_column}='{labels.iloc[first]}'\n"
+            f"{cause}\n"
+            "Features are matched BY ROW ORDER, not joined on a key."
+        )
+
+    drop = {label_column}
+    if feature_columns:
+        if isinstance(feature_columns, dict):
+            for cols in feature_columns.values():
+                drop.update(cols or [])
+        else:
+            drop.update(feature_columns)
+    X = features.drop(columns=[c for c in drop if c in features.columns])
+    if X.shape[1] == 0:
+        raise ValueError(
+            f"No feature columns remain in '{feature_path}' after dropping "
+            f"{sorted(drop)} (label_column plus anything named in feature_columns). "
+            "The file needs at least one column that is not the label and not "
+            "already supplied as a node/edge/graph attribute."
+        )
+    non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
+    if non_numeric:
+        raise ValueError(
+            f"Non-numeric feature columns in '{feature_path}': {non_numeric}. "
+            "Encode them numerically before use (e.g. one-hot), or name them in "
+            "feature_columns so they are handled as graph attributes instead of "
+            "being treated as features."
+        )
+    values = X.to_numpy(dtype=float)
+    finite = np.isfinite(values).all(axis=0)
+    if not finite.all():
+        bad = X.columns[~finite].tolist()
+        counts = {c: int((~np.isfinite(X[c].to_numpy(dtype=float))).sum()) for c in bad}
+        raise ValueError(
+            f"NaN or inf values in '{feature_path}'. Affected columns and counts: "
+            f"{counts}. Impute or drop them before training — they would propagate "
+            "into the loss and produce NaN gradients."
+        )
+    return X
+
+
 def featurize(
     data_path,
     mol_column,
     save_dir,
-    representation="learned",
-    depth=4,
     center_columns=None,
-    prefix="",
     feature_columns=None,
     graph_format="mol2",
 ):
     """
-    Helper function to featurize molecules either with RACs or additional user-provided features.
+    Helper function to collect molecule strings and user-provided features for graph models.
     INPUTS:
         data_path: str
             Path to data containing molecular graphs and other associated properties.
@@ -462,8 +418,6 @@ def featurize(
             Column containing molecular graphs.
         save_dir: str
             Directory where results are saved.
-        representation: str
-            Representation scheme to use, either RACs for an MLP or a learned representation for a GNN
             default='learned'
         depth: int
             Maximum depth of graph searched when generating RACs.
@@ -508,48 +462,12 @@ def featurize(
     # automatically scale/encode user-provided features
     extra_features, _ = scale_and_encode_user_features(extra_features)
 
-    if representation == "auto":
-        mols = get_mol3D(
-            data=all_data, mol_column=mol_column, graph_format=graph_format
-        )
-        # full-complex RACs
-        racs_data_full = get_racs(
-            data=all_data,
-            mols=mols,
-            save_dir=save_dir,
-            depth=depth,
-            center_columns=None,
-            prefix=prefix,
-        )
-        # metal-centered RACs
-        if center_columns:
-            racs_data_centered = get_racs(
-                data=all_data,
-                mols=mols,
-                save_dir=save_dir,
-                depth=depth,
-                center_columns=center_columns,
-                prefix=prefix,
-            )
-        else:
-            racs_data_centered = None
-        # combine data
-        X_data = pd.concat(
-            [
-                data
-                for data in [racs_data_full, racs_data_centered, extra_features]
-                if data is not None
-            ],
-            axis=1,
-        )
-
-    elif representation == "learned":
-        columns = [mol_column]
-        if center_columns:
-            columns.extend(center_columns)
-        X_data = all_data[columns]
-        if feature_columns and not extra_features["graph"].empty:
-            X_data = pd.concat([X_data, extra_features["graph"]], axis=1)
+    columns = [mol_column]
+    if center_columns:
+        columns.extend(center_columns)
+    X_data = all_data[columns]
+    if feature_columns and not extra_features["graph"].empty:
+        X_data = pd.concat([X_data, extra_features["graph"]], axis=1)
 
     return X_data, all_data, extra_features
 
@@ -744,7 +662,7 @@ def scale(
     target_column,
     save_dir,
     scale: bool = False,
-    representation: str = "learned",
+    scale_features: bool = False,
     y_scaler=None,
 ):
     """
@@ -759,8 +677,10 @@ def scale(
             String indicating which column of y data contains target property.
         save_dir: str
             Directory where results are saved.
-        representation: str
-            Representation scheme to use, either RACs for an MLP or a learned representation for a GNN.
+        scale_features: bool
+            Standardize X (dropping invariant and duplicate columns first). Used by
+            encoder-free models, whose features are numeric tables; graph models
+            carry molecule strings in X and leave it untouched.
             default='learned'
         y_scaler: sklearn.preprocessing.StandardScaler or None, default None
             If provided AND ``scale`` is True, the function will use this pre-fitted
@@ -779,8 +699,8 @@ def scale(
     # here; ``y_scaler`` keeps whatever the caller provided (None by default,
     # in which case the regression branch below fits a fresh ``StandardScaler``).
     X_scaler = None
-    # process RACs features for MLPs
-    if representation == "auto":
+    # tabular (encoder-free) models: prune degenerate columns and standardize
+    if scale_features:
         # drop any invariant columns (i.e., feature with same value for all samples in training data)
         drop_columns = X_train.columns[X_train.nunique() == 1].tolist()
         X_train.drop(columns=drop_columns, inplace=True)
@@ -809,8 +729,7 @@ def scale(
         X_test_scaled = pd.DataFrame(
             X_scaler.transform(X_test), columns=X_test.columns, index=X_test.index
         )
-    # process learned representations for GNNs
-    # elif representation == "learned":
+    # graph models: X holds molecule strings, so there is nothing to standardize
     # if there are extra features:
     #     # fit X scaler to training data, transform all three data splits
     #     X_scaler = StandardScaler()
@@ -2014,7 +1933,6 @@ def mol_to_graph(
 def validate_inputs(
     data_path,
     task,
-    representation,
     center_columns,
     graph_format,
     mol_column,
@@ -2051,11 +1969,6 @@ def validate_inputs(
             f"Task '{task}' must be either 'regression' or 'classification'"
         )
 
-    representation = representation.lower()
-    if representation not in ["auto", "learned"]:
-        raise ValueError(
-            f"Representation '{representation}' must be either 'auto' or 'learned'"
-        )
 
     if center_columns is not None and not isinstance(center_columns, list):
         center_columns = [center_columns]
@@ -2126,7 +2039,7 @@ def validate_inputs(
                         f"{arg_name} column '{col_name}' not found in '{data_split}'"
                     )
 
-    return presplit, task, representation, center_columns, graph_format, drop_indices
+    return presplit, task, center_columns, graph_format, drop_indices
 
 
 def get_csv_header(csv_path):
