@@ -13,6 +13,7 @@ from molSimplify.Informatics.MOF.PBC_functions import (
     readcif,
 )
 import networkx as nx
+import hashlib
 import numpy as np
 import os
 import pandas as pd
@@ -288,66 +289,167 @@ def scale_and_encode_user_features(extra_features_dict):
     return extra_features_dict, scalers_dict
 
 
-def load_tabular_features(feature_path, raw_path, label_column, feature_columns=None):
-    """Load a precomputed feature table and align it to its raw-data split.
+def _read_feature_table(path):
+    """Read a feature table from .csv, .npy, or .parquet.
 
-    Used by encoder-free (tabular) models, where features come from a user-supplied
-    CSV instead of being derived from a molecular graph.
+    ``.npy`` is the right choice for wide embeddings: a 256-dim table for ~260k
+    rows is ~8 GB as CSV text but ~130 MB as float32 binary, and loads in
+    seconds rather than minutes. A ``.npy`` file carries no column names, so
+    columns are auto-named ``f0..fN`` and the label column must be supplied
+    separately via ``labels_path``.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        return pd.read_csv(path)
+    if ext == ".parquet":
+        return pd.read_parquet(path)
+    if ext == ".npy":
+        values = np.load(path, mmap_mode="r")
+        if values.ndim != 2:
+            raise ValueError(
+                f"'{path}' must be a 2-D array of shape (n_rows, n_features) for "
+                f"graph-level features or (n_atoms, n_features) for per-atom "
+                f"features; got shape {values.shape}."
+            )
+        arr = np.asarray(values, dtype="float32")
+        return pd.DataFrame(
+            arr, columns=[f"f{i}" for i in range(arr.shape[1])], copy=False
+        )
+    raise ValueError(
+        f"Unsupported feature-file format '{ext}' for '{path}'. "
+        "Expected .csv, .npy, or .parquet."
+    )
 
-    ROW-ORDER CONTRACT: ``feature_path`` and ``raw_path`` are matched BY POSITION.
-    Row *i* of the feature file is assumed to describe the same sample as row *i*
-    of the raw split; the files are never joined on a key. Both must therefore
-    contain the same samples, in the same order, one row each. ``label_column`` is
-    compared elementwise as a guard, so a re-ordered, truncated, or unrelated file
-    raises instead of silently pairing features with the wrong targets.
 
-    Every column is treated as a feature except ``label_column`` and any column
+def load_tabular_features(
+    feature_path,
+    raw_path,
+    label_column,
+    feature_columns=None,
+    offsets_path=None,
+    labels_path=None,
+):
+    """Load precomputed features and align them to their raw-data split.
+
+    Used by encoder-free models, where features come from user-supplied files
+    instead of being derived from a molecular graph. Two shapes are supported:
+
+    * **graph-level** — one feature row per sample. ``offsets_path`` is None.
+    * **per-atom** — a stacked ``(total_atoms, n_features)`` table plus an
+      ``offsets`` array of length ``n_rows + 1``, where sample *i* owns rows
+      ``offsets[i]:offsets[i+1]``. This preserves per-atom resolution (e.g.
+      foundation-model embeddings) so a transformer readout can attend over
+      atoms without an encoder.
+
+    ROW-ORDER CONTRACT: features and ``raw_path`` are matched BY POSITION. Row
+    *i* of the feature table (or atom-block *i* in per-atom mode) is assumed to
+    describe the same sample as row *i* of the raw split; the files are never
+    joined on a key. Both must contain the same samples, in the same order, one
+    row each. ``label_column`` is compared elementwise as a guard, so a
+    re-ordered, truncated, or unrelated file raises instead of silently pairing
+    features with the wrong targets.
+
+    Every column is used as a feature except ``label_column`` and any column
     named in ``feature_columns`` (those are injected separately as graph
     attributes, so including them here would duplicate them).
 
     Parameters
     ----------
     feature_path : str
-        CSV of precomputed features for one split.
+        Feature table: ``.csv``, ``.npy``, or ``.parquet``.
     raw_path : str
         The corresponding split of ``raw_data_path``, used for alignment checks.
     label_column : str
-        Identifier column present in both files.
+        Identifier column present in the raw split, and in the feature file
+        unless ``labels_path`` is given.
     feature_columns : dict or list or None
         Columns already supplied to the model as node/edge/graph attributes.
+    offsets_path : str or None
+        ``.npy`` of shape ``(n_rows + 1,)`` giving atom-block boundaries. When
+        supplied, ``feature_path`` is read as a per-atom table.
+    labels_path : str or None
+        One-column CSV of ``label_column`` values, one per sample. Required when
+        ``feature_path`` is ``.npy`` (binary arrays carry no labels).
 
     Returns
     -------
-    pandas.DataFrame
-        Numeric feature matrix, indexed like the raw split.
+    (pandas.DataFrame, numpy.ndarray or None)
+        Numeric feature matrix, and atom offsets in per-atom mode (else None).
     """
-    features = pd.read_csv(feature_path)
+    features = _read_feature_table(feature_path)
     if label_column is None:
         raise ValueError(
             "label_column is required when using precomputed features so that the "
             "feature table can be verified against the raw data."
         )
-    if label_column not in features.columns:
+
+    raw = pd.concat(
+        pd.read_csv(raw_path, usecols=lambda c: c in (label_column, "natoms"),
+                    chunksize=20000),
+        ignore_index=True,
+    )
+    if label_column not in raw.columns:
         raise ValueError(
-            f"label_column '{label_column}' not found in feature file '{feature_path}'."
+            f"label_column '{label_column}' not found in raw split '{raw_path}'."
         )
-    labels = pd.concat(
-        pd.read_csv(raw_path, usecols=[label_column], chunksize=20000), ignore_index=True
-    )[label_column]
-    if len(features) != len(labels):
+    labels = raw[label_column]
+
+    offsets = None
+    if offsets_path is not None:
+        offsets = np.asarray(np.load(offsets_path), dtype=np.int64)
+        if offsets.ndim != 1 or len(offsets) < 2:
+            raise ValueError(
+                f"Offsets '{offsets_path}' must be a 1-D array of length n_rows+1; "
+                f"got shape {offsets.shape}."
+            )
+        if offsets[0] != 0 or offsets[-1] != len(features):
+            raise ValueError(
+                f"Offsets '{offsets_path}' do not span the feature table: expected "
+                f"offsets[0]=0 and offsets[-1]={len(features)} (the number of atom "
+                f"rows), got {offsets[0]} and {offsets[-1]}."
+            )
+        if np.any(np.diff(offsets) <= 0):
+            bad = int(np.argmax(np.diff(offsets) <= 0))
+            raise ValueError(
+                f"Offsets '{offsets_path}' must be strictly increasing (every sample "
+                f"needs at least one atom); sample {bad} has "
+                f"{int(np.diff(offsets)[bad])} atoms."
+            )
+
+    # feature-file labels: inline for csv/parquet, separate for npy
+    if labels_path is not None:
+        feature_labels = pd.read_csv(labels_path)[label_column]
+    elif label_column in features.columns:
+        feature_labels = features[label_column]
+    else:
+        raise ValueError(
+            f"label_column '{label_column}' not found in '{feature_path}' and no "
+            "labels_path was given. Binary .npy feature files carry no column "
+            "names, so pass labels_path pointing at a one-column CSV of "
+            f"'{label_column}' values in the same row order."
+        )
+
+    n_samples = len(offsets) - 1 if offsets is not None else len(features)
+    if len(feature_labels) != n_samples:
+        raise ValueError(
+            f"Label file provides {len(feature_labels):,} labels but the feature "
+            f"table describes {n_samples:,} samples ({feature_path})."
+        )
+    if n_samples != len(labels):
+        kind = "atom blocks" if offsets is not None else "rows"
         raise ValueError(
             f"Row-count mismatch between precomputed features and raw data.\n"
-            f"  features : {len(features):>9,} rows  ({feature_path})\n"
+            f"  features : {n_samples:>9,} {kind}  ({feature_path})\n"
             f"  raw data : {len(labels):>9,} rows  ({raw_path})\n"
             "Precomputed features are matched to the raw data BY ROW ORDER, not by "
             "joining on a key, so the two files must contain the same samples in the "
             "same order, one row each."
         )
-    mismatch = features[label_column].to_numpy() != labels.to_numpy()
+    mismatch = feature_labels.to_numpy() != labels.to_numpy()
     if mismatch.any():
         first = int(mismatch.argmax())
         n_bad = int(mismatch.sum())
-        same_set = set(features[label_column]) == set(labels)
+        same_set = set(feature_labels) == set(labels)
         cause = (
             "The two files contain the same samples but in a different order — "
             "re-sort the feature file to match the raw data."
@@ -359,11 +461,25 @@ def load_tabular_features(feature_path, raw_path, label_column, feature_columns=
             f"({n_bad:,} of {len(labels):,} rows disagree).\n"
             f"  first mismatch at row {first}:\n"
             f"    features '{feature_path}' has {label_column}="
-            f"'{features[label_column].iloc[first]}'\n"
+            f"'{feature_labels.iloc[first]}'\n"
             f"    raw data '{raw_path}' has {label_column}='{labels.iloc[first]}'\n"
             f"{cause}\n"
             "Features are matched BY ROW ORDER, not joined on a key."
         )
+    # per-atom blocks must match the tabulated atom counts
+    if offsets is not None and "natoms" in raw.columns:
+        block_sizes = np.diff(offsets)
+        natoms = raw["natoms"].to_numpy(dtype=np.int64)
+        wrong = block_sizes != natoms
+        if wrong.any():
+            i = int(wrong.argmax())
+            raise ValueError(
+                f"Per-atom feature blocks do not match the tabulated atom counts "
+                f"({int(wrong.sum()):,} of {len(natoms):,} samples disagree). First at "
+                f"sample {i} ({label_column}='{labels.iloc[i]}'): offsets give "
+                f"{int(block_sizes[i])} atoms but natoms says {int(natoms[i])}. The "
+                "offsets array is out of sync with the feature table."
+            )
 
     drop = {label_column}
     if feature_columns:
@@ -388,17 +504,26 @@ def load_tabular_features(feature_path, raw_path, label_column, feature_columns=
             "feature_columns so they are handled as graph attributes instead of "
             "being treated as features."
         )
-    values = X.to_numpy(dtype=float)
-    finite = np.isfinite(values).all(axis=0)
-    if not finite.all():
-        bad = X.columns[~finite].tolist()
-        counts = {c: int((~np.isfinite(X[c].to_numpy(dtype=float))).sum()) for c in bad}
+    # Check finiteness column-by-column on the native dtype. A single
+    # X.to_numpy(dtype=float) would materialise a float64 copy of the whole
+    # table -- 12.5 GB for a per-atom embedding table of ~12M atoms x 128 dims,
+    # on top of the array and the frame -- which is enough to push a large
+    # per-atom run past its memory limit before training even starts.
+    bad, counts = [], {}
+    for c in X.columns:
+        colv = X[c].to_numpy(copy=False)
+        nbad = int((~np.isfinite(colv)).sum())
+        if nbad:
+            bad.append(c)
+            if len(counts) < 10:
+                counts[c] = nbad
+    if bad:
         raise ValueError(
-            f"NaN or inf values in '{feature_path}'. Affected columns and counts: "
-            f"{counts}. Impute or drop them before training — they would propagate "
-            "into the loss and produce NaN gradients."
+            f"NaN or inf values in '{feature_path}'. Affected columns and counts "
+            f"(first 10 of {len(bad)}): {counts}. Impute or drop them before "
+            "training — they would propagate into the loss and produce NaN gradients."
         )
-    return X
+    return X, offsets
 
 
 def featurize(
@@ -701,16 +826,34 @@ def scale(
     X_scaler = None
     # tabular (encoder-free) models: prune degenerate columns and standardize
     if scale_features:
-        # drop any invariant columns (i.e., feature with same value for all samples in training data)
-        drop_columns = X_train.columns[X_train.nunique() == 1].tolist()
+        # drop any invariant columns (i.e., feature with same value for all samples
+        # in training data). min == max is equivalent to nunique() == 1 here and
+        # is a single vectorised pass instead of building a hash table per column.
+        col_min, col_max = X_train.min(), X_train.max()
+        drop_columns = X_train.columns[col_min == col_max].tolist()
         X_train.drop(columns=drop_columns, inplace=True)
         X_val.drop(columns=drop_columns, inplace=True)
         X_test.drop(columns=drop_columns, inplace=True)
         if len(drop_columns) >= 1:
             print(f"Dropped {len(drop_columns)} invariant columns: {drop_columns}")
-        # drop any redundant columns (i.e., multiple features with same value for all samples in training data)
-        duplicate_mask = X_train.T.duplicated()
-        drop_columns = X_train.columns[duplicate_mask].tolist()
+        # drop any redundant columns (i.e., multiple features with same value for all
+        # samples in training data).
+        #
+        # This used to be ``X_train.T.duplicated()``, which transposes the frame so
+        # every SAMPLE becomes a column. That is fine for a RACs table (hundreds of
+        # features, ~1e5 rows) but scales as ~n^1.9 in the row count -- measured at
+        # 3.9 s / 11.7 s / 52.8 s for 50k / 100k / 200k rows, extrapolating to ~33 h
+        # for a per-atom embedding table of ~1.2e7 rows. Hashing each column's bytes
+        # is a single linear pass and finds exactly the same duplicates.
+        seen, drop_columns = {}, []
+        for c in X_train.columns:
+            digest = hashlib.blake2b(
+                np.ascontiguousarray(X_train[c].to_numpy()).tobytes(), digest_size=16
+            ).digest()
+            if digest in seen:
+                drop_columns.append(c)
+            else:
+                seen[digest] = c
         X_train.drop(columns=drop_columns, inplace=True)
         X_val.drop(columns=drop_columns, inplace=True)
         X_test.drop(columns=drop_columns, inplace=True)

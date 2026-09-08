@@ -21,6 +21,83 @@ from tqdm import tqdm
 import numpy as np
 
 
+def attach_node_features(graphs, values_path, offsets_path, labels_path, mode, split):
+    """Seed each graph's node features with precomputed per-atom vectors.
+
+    Lets a foundation-model embedding (e.g. UMA per-atom output) serve as the
+    *initial* node representation that the GNN/EGNN encoder then refines by
+    message passing, rather than being pooled and fed straight to a readout.
+
+    ``values_path`` is a stacked ``(total_atoms, D)`` array and ``offsets_path``
+    an ``(n_graphs + 1,)`` index, so graph *i* owns rows
+    ``offsets[i]:offsets[i+1]`` -- the same layout the encoder-free path uses.
+
+    ROW-ORDER CONTRACT: blocks are matched to graphs BY POSITION, and atom *k*
+    of block *i* must be atom *k* of graph *i*. Graph construction preserves the
+    source .xyz atom order, so this holds when the embeddings were extracted from
+    the same file in the same order. Both the per-graph atom count and (when
+    ``labels_path`` is given) the identifier are checked, so a mismatch raises
+    rather than silently pairing atoms with the wrong embeddings.
+
+    Parameters
+    ----------
+    graphs : list of Data
+        Graphs for one split, already carrying ``x`` and ``label``.
+    values_path, offsets_path : str
+        ``.npy`` files holding the stacked per-atom features and their offsets.
+    labels_path : str or None
+        One-column CSV of identifiers, one per graph, for the order check.
+    mode : {'concat', 'replace'}
+        ``concat`` appends the vectors to the existing node features (keeping
+        ElemeNet's atom typing); ``replace`` uses them alone, which isolates
+        what message passing adds to the embedding itself.
+    split : str
+        Split name, for error messages.
+    """
+    if mode not in ("concat", "replace"):
+        raise ValueError(f"node_feature_mode must be 'concat' or 'replace', got '{mode}'.")
+    values = np.load(values_path, mmap_mode="r")
+    offsets = np.asarray(np.load(offsets_path), dtype=np.int64)
+    n = len(offsets) - 1
+    if n != len(graphs):
+        raise ValueError(
+            f"{split}: node-feature file describes {n:,} graphs but the split has "
+            f"{len(graphs):,}. Per-atom node features are matched to graphs by row "
+            "order, so the files must cover the same samples in the same order."
+        )
+    if int(offsets[-1]) != values.shape[0]:
+        raise ValueError(
+            f"{split}: offsets end at {int(offsets[-1]):,} but '{values_path}' has "
+            f"{values.shape[0]:,} atom rows."
+        )
+    labels = None
+    if labels_path is not None:
+        labels = pd.read_csv(labels_path).iloc[:, 0].tolist()
+        if len(labels) != n:
+            raise ValueError(
+                f"{split}: {len(labels):,} labels for {n:,} graphs ({labels_path})."
+            )
+    for i, g in enumerate(graphs):
+        lo, hi = int(offsets[i]), int(offsets[i + 1])
+        if g.x.shape[0] != hi - lo:
+            raise ValueError(
+                f"{split}: graph {i} has {g.x.shape[0]} atoms but its node-feature "
+                f"block has {hi - lo}. The embeddings were extracted from a "
+                "different structure or atom ordering than the graphs were built "
+                "from; they cannot be aligned."
+            )
+        if labels is not None:
+            gl = g.label[0] if isinstance(g.label, (list, tuple)) else g.label
+            if gl != labels[i]:
+                raise ValueError(
+                    f"{split}: graph {i} is '{gl}' but the node-feature file has "
+                    f"'{labels[i]}' at that position. The two are not row-aligned."
+                )
+        block = torch.tensor(np.asarray(values[lo:hi], dtype="float32"))
+        g.x = block if mode == "replace" else torch.cat([g.x, block], dim=-1)
+    return graphs
+
+
 class GraphDataset(Dataset):
     """
     Dataset class to handle graph objects.
@@ -64,6 +141,8 @@ class DataModule:
         task,
         data_path=os.getcwd(),
         feature_data_path=None,
+        feature_offsets_path=None,
+        feature_labels_path=None,
         label_column=None,
         center_columns=None,
         feature_columns=None,
@@ -177,19 +256,32 @@ class DataModule:
             # raw_data_path; the feature files are matched to it by row order.
             if not presplit or len(feature_data_path) != 3:
                 raise ValueError(
-                    "feature_data_path must be a list of three CSVs ordered as "
-                    "[train, val, test], matching a presplit raw_data_path."
+                    "feature_data_path must be a list of three feature files ordered "
+                    "as [train, val, test], matching a presplit raw_data_path."
                 )
+            for name, paths in (("feature_offsets_path", feature_offsets_path),
+                                ("feature_labels_path", feature_labels_path)):
+                if paths is not None and len(paths) != 3:
+                    raise ValueError(
+                        f"{name} must be a list of three files ordered as "
+                        f"[train, val, test], got {len(paths)}."
+                    )
+            offsets_paths = feature_offsets_path or [None] * 3
+            labels_paths = feature_labels_path or [None] * 3
             target_cols = (
                 [target_column] if isinstance(target_column, str) else list(target_column or [])
             )
             X_splits, y_splits, extra_features_splits = [], [], []
-            for feat_path, raw_path in zip(feature_data_path, raw_data_path):
-                X_splits.append(
-                    load_tabular_features(
-                        feat_path, raw_path, label_column, feature_columns
-                    )
+            atom_offsets = []
+            for feat_path, raw_path, off_path, lab_path in zip(
+                feature_data_path, raw_data_path, offsets_paths, labels_paths
+            ):
+                X, offsets = load_tabular_features(
+                    feat_path, raw_path, label_column, feature_columns,
+                    offsets_path=off_path, labels_path=lab_path,
                 )
+                X_splits.append(X)
+                atom_offsets.append(offsets)
                 keep = [label_column] + [c for c in target_cols if c != label_column]
                 raw = pd.concat(
                     pd.read_csv(raw_path, chunksize=20000), ignore_index=True
@@ -198,9 +290,12 @@ class DataModule:
                 extra = get_extra_features(data=raw, feature_columns=feature_columns)
                 extra, _ = scale_and_encode_user_features(extra)
                 extra_features_splits.append(extra)
+            per_atom = atom_offsets[0] is not None
+            kind = "atom rows" if per_atom else "rows"
             print(
-                f"Loaded precomputed features: {X_splits[0].shape[1]} columns, "
-                f"{[len(x) for x in X_splits]} rows per split."
+                f"Loaded precomputed {'per-atom' if per_atom else 'graph-level'} "
+                f"features: {X_splits[0].shape[1]} columns, "
+                f"{[len(x) for x in X_splits]} {kind} per split."
             )
         elif not presplit:
             # featurize
@@ -281,6 +376,16 @@ class DataModule:
             save_dir=data_path,
             y_scaler=y_scaler,
         )
+
+        # per-atom feature blocks: offsets ride alongside the feature tables so
+        # process() can slice the stacked (total_atoms, D) matrix back into samples
+        if feature_data_path is not None and atom_offsets[0] is not None:
+            os.makedirs(os.path.join(data_path, "X_data"), exist_ok=True)
+            for name, offsets in zip(["train", "val", "test"], atom_offsets):
+                np.save(
+                    os.path.join(data_path, "X_data", f"atom_offsets_{name}.npy"),
+                    offsets,
+                )
 
         # save extra features
         if feature_columns:
@@ -596,16 +701,43 @@ class DataModule:
                         graph_attr = torch.tensor(
                             pd.read_pickle(graph_path).to_numpy(dtype="float32")
                         )
-                        if len(graph_attr) != len(features):
-                            raise ValueError(
-                                f"{split}: {len(graph_attr)} graph-attribute rows for "
-                                f"{len(features)} feature rows."
-                            )
+                # per-atom features arrive as a stacked (total_atoms, D) table plus
+                # offsets; sample i owns rows offsets[i]:offsets[i+1]. Without
+                # offsets each row is one sample, x is (1, D), and no pooling is
+                # needed. With offsets x is (n_atoms, D) and the readout pools (MLP)
+                # or attends over atoms (transformer).
+                offsets_path = os.path.join(
+                    data_path, "X_data", f"atom_offsets_{split}.npy"
+                )
+                offsets = (
+                    np.load(offsets_path) if os.path.exists(offsets_path) else None
+                )
+                if offsets is not None:
+                    if len(features) != int(offsets[-1]):
+                        raise ValueError(
+                            f"{split}: offsets end at {int(offsets[-1])} but the "
+                            f"feature table has {len(features)} atom rows."
+                        )
+                    n_samples = len(offsets) - 1
+                    if graph_attr is not None and len(graph_attr) != n_samples:
+                        raise ValueError(
+                            f"{split}: {len(graph_attr)} graph-attribute rows for "
+                            f"{n_samples} samples."
+                        )
+                else:
+                    n_samples = len(features)
+                    if graph_attr is not None and len(graph_attr) != n_samples:
+                        raise ValueError(
+                            f"{split}: {len(graph_attr)} graph-attribute rows for "
+                            f"{n_samples} feature rows."
+                        )
                 data_ = []
-                for i in tqdm(range(len(features)), total=len(features), desc=feature_desc):
-                    # one sample per row: x is (1, n_features) so batching yields
-                    # (batch_size, n_features) with no pooling required
-                    d = Data(x=features[i].unsqueeze(0))
+                for i in tqdm(range(n_samples), total=n_samples, desc=feature_desc):
+                    if offsets is None:
+                        x = features[i].unsqueeze(0)
+                    else:
+                        x = features[int(offsets[i]) : int(offsets[i + 1])]
+                    d = Data(x=x)
                     if graph_attr is not None:
                         d.graph_attr = graph_attr[i].unsqueeze(0)
                     data_.append(d)
@@ -720,6 +852,10 @@ class DataModule:
         data_path=os.getcwd(),
         implicit_Hs=False,
         rdkit_features=False,
+        node_feature_path=None,
+        node_feature_offsets_path=None,
+        node_feature_labels_path=None,
+        node_feature_mode="concat",
     ):
         """Build graph datasets and cache them to disk, or load from cache if available.
 
@@ -770,6 +906,10 @@ class DataModule:
             self.scaler = pd.read_pickle(scaler_path)
         # ``target_column`` is None for prediction-only inference on unlabelled data
         cache_name = "_".join(target_column) if target_column else "no_target"
+        # graphs seeded with precomputed node features are a different dataset, so
+        # they must not share a cache with the plain-featured build
+        if node_feature_path is not None:
+            cache_name += f"_nodefeat-{node_feature_mode}"
         save_path = os.path.join(
             data_path, f"processed_graphs_{cache_name}.pt"
         )
@@ -820,6 +960,29 @@ class DataModule:
             self.graphs_splits = self.get_processed_targets(
                 data_path, target_column, X_splits, scope=scope, label_column=label_column
             )
+
+            if node_feature_path is not None:
+                if node_feature_offsets_path is None:
+                    raise ValueError(
+                        "node_feature_offsets_path is required alongside "
+                        "node_feature_path: without offsets there is no way to know "
+                        "which atom rows belong to which graph."
+                    )
+                labels = node_feature_labels_path or [None, None, None]
+                for idx, split in enumerate(["train", "val", "test"]):
+                    self.graphs_splits[idx] = attach_node_features(
+                        self.graphs_splits[idx],
+                        node_feature_path[idx],
+                        node_feature_offsets_path[idx],
+                        labels[idx],
+                        node_feature_mode,
+                        split,
+                    )
+                print(
+                    f"Seeded node features from precomputed embeddings "
+                    f"(mode={node_feature_mode}); node feature dim is now "
+                    f"{self.graphs_splits[0][0].x.shape[1]}."
+                )
 
             self.target_column = target_column
             self.label_column = label_column

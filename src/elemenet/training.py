@@ -207,6 +207,25 @@ def training_pipeline(
     # save all input parameters to a yaml file
     input_params = {k: v for k, v in locals().items() if not k.startswith("_")}
 
+    # Node-feature options live in preprocessing_kwargs alongside raw_data_path and
+    # feature_data_path, since they describe the data rather than the model. They are
+    # consumed by process() rather than preprocess(), so route them out here; they
+    # stay in input_params above, so config.yaml still records them.
+    _NODE_FEATURE_KEYS = (
+        "node_feature_path",
+        "node_feature_offsets_path",
+        "node_feature_labels_path",
+        "node_feature_mode",
+    )
+    node_feature_kwargs = {"node_feature_mode": "concat"}
+    if preprocessing_kwargs is not None:
+        node_feature_kwargs.update(
+            {k: preprocessing_kwargs.pop(k) for k in _NODE_FEATURE_KEYS
+             if k in preprocessing_kwargs}
+        )
+    node_feature_path = node_feature_kwargs.get("node_feature_path")
+    node_feature_mode = node_feature_kwargs["node_feature_mode"]
+
     # save training hyperparams before model_config may be replaced by a checkpoint's
     # architecture-only model_config (which does not store loss_type/optimizer_type).
     _loss_type = model_config.get("loss_type")
@@ -285,7 +304,10 @@ def training_pipeline(
     # the X_data/y_data pickles in that case, so re-running preprocess() is
     # wasted work (30-60 min on multi-million-row datasets per resume).
     _target_cols = [target_column] if isinstance(target_column, str) else list(target_column)
-    _cache_path = os.path.join(data_path, f"processed_graphs_{'_'.join(_target_cols)}.pt")
+    _cache_suffix = f"_nodefeat-{node_feature_mode}" if node_feature_path is not None else ""
+    _cache_path = os.path.join(
+        data_path, f"processed_graphs_{'_'.join(_target_cols)}{_cache_suffix}.pt"
+    )
     _cache_exists = os.path.isfile(_cache_path) and os.path.getsize(_cache_path) > 0
 
     if preprocessing_kwargs is not None:
@@ -335,6 +357,7 @@ def training_pipeline(
         data_path=data_path,
         implicit_Hs=implicit_Hs,
         rdkit_features=rdkit_features,
+        **node_feature_kwargs,
     )
     # a sentinel written *after* process() returns guarantees torch.save is complete,
     # so non-main ranks can safely load the cache without seeing a truncated file.

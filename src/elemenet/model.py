@@ -623,29 +623,22 @@ def build_model(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if encoder_type is None and scope != "graph":
-        detail = (
-            "there are no per-atom embeddings to predict from"
-            if scope == "node"
-            else "there is no bond structure to predict on"
-        )
+    if encoder_type is None and scope == "edge":
         raise ValueError(
-            f"Encoder-free models (encoder_type=None) support scope='graph' only, "
-            f"got scope='{scope}'. Precomputed features supply exactly one feature "
-            f"vector per sample, so {detail}. Either set scope='graph' to predict "
-            f"one value per sample, or use a graph encoder (encoder_type='gnn' or "
-            f"'egnn') if you need {scope}-level targets."
+            "Encoder-free models (encoder_type=None) cannot use scope='edge': "
+            "precomputed features carry no bond structure. Use a graph encoder "
+            "(encoder_type='gnn' or 'egnn') for edge-level targets."
         )
+    # scope='node' is permitted here and validated at the first forward instead:
+    # it is well posed with PER-ATOM features (one prediction per atom) but not
+    # with pooled ones, and build time cannot tell the two apart.
 
-    if encoder_type is None and readout_type != "mlp":
+    if encoder_type is None and readout_type not in ("mlp", "transformer"):
         raise ValueError(
-            f"Encoder-free models (encoder_type=None) support readout_type='mlp' "
-            f"only, got readout_type='{readout_type}'. The transformer readout "
-            "attends over the nodes of a graph, but precomputed features give one "
-            "vector per sample, so the sequence length is 1 and attention is a "
-            "no-op — the model would silently become an MLP carrying unused "
-            "attention parameters. Use readout_type='mlp' for a tabular baseline, "
-            "or a graph encoder if you want a genuine transformer."
+            f"Encoder-free models (encoder_type=None) support readout_type='mlp' or "
+            f"'transformer', got readout_type='{readout_type}'. "
+            "'edge_predictor' needs edge structure that precomputed features do not "
+            "carry."
         )
 
     if encoder_type is None:
@@ -784,10 +777,32 @@ class Model(nn.Module):
                 # for node-level prediction, restrict output to subgraph nodes if defined
                 x, batch = self.subselect_node_embeddings(x, data)
         else:
-            # encoder-free (tabular) model: each sample carries a single feature
-            # row, so the batched x is already (batch_size, n_features) and needs
-            # no pooling — pool_fn stays None.
+            # encoder-free model: features are precomputed rather than message-passed.
+            # Graph-level features give one row per sample; per-atom features give
+            # n_atoms rows. Pooling handles both — with one row per sample it is the
+            # identity, so this is safe for graph-level features too.
             x, embeddings = data.x, data.x
+            if self.scope == "graph":
+                pool_fn = POOL_MAP[self.pooling]
+            if self.scope == "node" and x.size(0) == data.num_graphs:
+                raise ValueError(
+                    "scope='node' with encoder_type=None requires per-atom "
+                    f"features, but x has {x.size(0)} rows for {data.num_graphs} "
+                    "samples — one vector each. Pooled features cannot produce "
+                    "per-atom predictions. Supply feature_offsets_path alongside "
+                    "feature_data_path to keep per-atom resolution."
+                )
+            if isinstance(self.readout, Transformer) and x.size(0) == data.num_graphs:
+                raise ValueError(
+                    "Transformer readout with encoder_type=None requires per-atom "
+                    f"features, but x has {x.size(0)} rows for {data.num_graphs} "
+                    "samples — one vector each. The transformer attends over atoms, "
+                    "so with a sequence length of 1 attention is a no-op and the "
+                    "model silently degenerates to an MLP carrying unused attention "
+                    "parameters. Either supply per-atom features (pass "
+                    "feature_offsets_path alongside feature_data_path) or use "
+                    "readout_type='mlp'."
+                )
 
         # extract graph-level attributes for concatenation after pooling
         graph_attr = getattr(data, "graph_attr", None)
