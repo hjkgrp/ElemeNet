@@ -57,21 +57,33 @@ class Trainer:
     """
 
     def __init__(self, model_config, optimizer_config, loss_config,
-                 scheduler_config=None, device=None, process_group=None):
+                 scheduler_config=None, device=None, process_group=None,
+                 grad_clip_norm=None, max_grad_skips=0):
         self.model_config = model_config
         self.optimizer_config = optimizer_config
         self.loss_config = loss_config
+        # max global gradient norm for clipping after backward(); None disables
+        # clipping (preserves the original behaviour). Useful for stabilising
+        # heavy-tailed losses (e.g. Gaussian NLL) whose gradients can spike.
+        self.grad_clip_norm = grad_clip_norm
+        # if > 0, skip (rather than apply) an optimizer step whose loss/gradient
+        # is non-finite, up to this many CONSECUTIVE skips before aborting with a
+        # NaNLossError. 0 disables skipping (a non-finite step propagates and is
+        # caught by the end-of-epoch NaN check, preserving the original behaviour).
+        self.max_grad_skips = max_grad_skips
+        self._consec_grad_skips = 0
         self.scheduler_config = scheduler_config or {
             "scheduler_type": None, "scheduler_config": {},
         }
 
         # save clean model_config which is used to set up the advanced model config
         self.clean_model_config = model_config.copy()
-        self.clean_model_config.update(
-            invert_encoder_config(
-                model_config["encoder_config"], model_config["encoder_type"]
+        if model_config.get("encoder_type") is not None:
+            self.clean_model_config.update(
+                invert_encoder_config(
+                    model_config["encoder_config"], model_config["encoder_type"]
+                )
             )
-        )
         self.clean_model_config.update(
             invert_readout_config(
                 model_config["readout_config"], model_config["readout_type"]
@@ -124,7 +136,7 @@ class Trainer:
             train_loader.sampler.set_epoch(epoch)
         model.train()
         running_loss = 0
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             batch = batch.to(self.device)
             optimizer.zero_grad()
             # call the model
@@ -133,7 +145,34 @@ class Trainer:
             loss = loss_fn(outputs)
             # backpropagation and optimization step
             loss.backward()
+            if self.grad_clip_norm is not None:
+                # clip_grad_norm_ returns the (pre-clip) total norm; non-finite here
+                # means a non-finite gradient that clipping cannot sanitise.
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), self.grad_clip_norm
+                )
+                step_is_finite = bool(torch.isfinite(total_norm))
+            else:
+                step_is_finite = bool(torch.isfinite(loss))
+            # optionally skip a non-finite step instead of writing NaN/Inf into the
+            # weights; abort after max_grad_skips consecutive skips.
+            if not step_is_finite and self.max_grad_skips > 0:
+                self._consec_grad_skips += 1
+                if self.is_main:
+                    print(
+                        f"  [skip {self._consec_grad_skips}/{self.max_grad_skips}] "
+                        f"non-finite loss/gradient at epoch {epoch}, batch {batch_idx} "
+                        f"— skipping optimizer step",
+                        flush=True,
+                    )
+                if self._consec_grad_skips >= self.max_grad_skips:
+                    raise NaNLossError(
+                        f"{self._consec_grad_skips} consecutive non-finite gradient "
+                        f"steps (max_grad_skips={self.max_grad_skips}) at epoch {epoch}"
+                    )
+                continue  # weights untouched; grads cleared by next zero_grad()
             optimizer.step()
+            self._consec_grad_skips = 0
             if scheduler is not None:
                 scheduler.step_batch()
             running_loss += loss.item()
@@ -284,7 +323,7 @@ class Trainer:
 
         if self.is_main:
             print(
-                f"Training {self.model_config['encoder_type'].upper()} model with "
+                f"Training {(self.model_config['encoder_type'] or 'encoder-free').upper()} model with "
                 f"{sum(param.numel() for param in model.parameters())} parameters"
             )
             print(f"Using device: {self.device}"
@@ -752,17 +791,26 @@ class Ensemble_regression:
     reduction : str, optional
         Reduction method: ``'mean'``, ``'sum'``, or ``'none'``. Default
         ``'mean'``.
+    sigma_min : float, optional
+        Smallest standard deviation the ensemble may claim, in units of the
+        standardized target. Bounds the residual term at ``r**2 / sigma_min**2``,
+        which is what keeps targets with a deterministic subpopulation (e.g. the
+        symmetry-enforced zero dipole of a centrosymmetric complex) from
+        collapsing the spread and diverging. Default ``1e-3``, reproducing the
+        historical variance clamp of ``1e-6``.
     """
 
-    def __init__(self, reduction="mean", **kwargs):
+    def __init__(self, reduction="mean", sigma_min=1e-3, **kwargs):
         assert reduction in ["mean", "sum", "none"], (
             f"Unknown reduction type: '{reduction}'"
             " (choose from 'mean', 'sum', or 'none')"
         )
+        assert sigma_min > 0, f"sigma_min must be positive, got {sigma_min}"
         self.reduction = reduction
+        self.sigma_min = sigma_min
 
     def __call__(self, prediction, target, uncertainty):
-        variance = torch.clip(torch.square(uncertainty), min=1e-6)
+        variance = torch.clip(torch.square(uncertainty), min=self.sigma_min**2)
         l1 = torch.log(variance)
         l2 = nn.functional.mse_loss(prediction, target, reduction="none") / variance
         nll = 0.5 * (l1 + l2)
@@ -1014,6 +1062,11 @@ def extract_loss_config(params):
         return {
             "loss_type": loss_type,
             "class_weight": params.get("class_weight", None),
+        }
+    elif loss_type == "ensemble_regression":
+        return {
+            "loss_type": loss_type,
+            "sigma_min": params.get("sigma_min", 1e-3),
         }
     else:
         return {"loss_type": loss_type}

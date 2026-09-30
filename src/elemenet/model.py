@@ -60,8 +60,16 @@ def build_encoder_config(encoder_type: str, params: dict):
     GNNConfig or EGNNConfig
     """
     if encoder_type not in ENCODER_CONFIG_MAP:
+        hint = (
+            " For an encoder-free model that feeds precomputed features straight "
+            "to the readout, set encoder_type=None (not 'mlp') and supply "
+            "feature_data_path in preprocessing_kwargs."
+            if encoder_type == "mlp"
+            else ""
+        )
         raise ValueError(
-            f"Unknown encoder type '{encoder_type}'. Expected one of {list(ENCODER_CONFIG_MAP.keys())}."
+            f"Unknown encoder type '{encoder_type}'. Expected one of "
+            f"{list(ENCODER_CONFIG_MAP.keys())}, or None for no encoder.{hint}"
         )
 
     # get encoder settings
@@ -111,6 +119,12 @@ def build_encoder_config(encoder_type: str, params: dict):
             aggregation_method=encoder_config.get("aggregation_method", "sum"),
             num_gaussians=encoder_config.get("num_gaussians", 64),
             inv_sublayers=encoder_config.get("inv_sublayers", 2),
+            # tanh bounds equivariant coordinate updates (|update| <= coords_range),
+            # preventing the unbounded coord/distance feedback that can blow EGNN
+            # activations up to fp32 overflow. Defaults preserve prior behaviour.
+            tanh=encoder_config.get("tanh", False),
+            coords_range=encoder_config.get("coords_range", 15),
+            use_norm=encoder_config.get("use_norm", False),
         )
 
 
@@ -258,6 +272,9 @@ def invert_encoder_config(config_obj, encoder_type: str):
         encoder_config["aggregation_method"] = cfg.get("aggregation_method", "sum")
         encoder_config["num_gaussians"] = cfg.get("num_gaussians", 64)
         encoder_config["inv_sublayers"] = cfg.get("inv_sublayers", 2)
+        encoder_config["tanh"] = cfg.get("tanh", False)
+        encoder_config["coords_range"] = cfg.get("coords_range", 15)
+        encoder_config["use_norm"] = cfg.get("use_norm", False)
 
     return {
         "encoder_type": encoder_type,
@@ -537,11 +554,17 @@ def extract_model_config(params):
     # get readout settings
     readout_config = build_readout_config(readout_type, params)
 
-    # optional get GNN encoder settings
-    encoder_config = build_encoder_config(encoder_type, params)
+    if encoder_type is None:
+        # encoder-free (tabular) model: the readout consumes precomputed features
+        # directly, so input_size stays as inferred from the feature table rather
+        # than being overwritten by an encoder's output width.
+        encoder_config = None
+    else:
+        # optional get GNN encoder settings
+        encoder_config = build_encoder_config(encoder_type, params)
 
-    # readout input = encoder output
-    readout_config.input_size = encoder_config.hidden_sizes[-1]
+        # readout input = encoder output
+        readout_config.input_size = encoder_config.hidden_sizes[-1]
 
     return {
         "scope": scope,
@@ -570,9 +593,11 @@ def build_model(
 
     Parameters
     ----------
-    encoder_type : str
-        Encoder architecture: ``'gnn'`` or ``'egnn'``. Pass ``None`` for a
-        pure MLP model (no encoder).
+    encoder_type : str or None
+        Encoder architecture: ``'gnn'`` or ``'egnn'``. Pass ``None`` for an
+        encoder-free model that feeds precomputed features straight to the
+        readout — useful as a tabular baseline. Encoder-free models require
+        ``scope='graph'`` and ``readout_type='mlp'``; both are enforced below.
     scope : str
         Prediction granularity: ``'graph'``, ``'node'``, or ``'edge'``.
     readout_config : MLPConfig, EdgePredictorConfig, or TransformerConfig
@@ -598,10 +623,22 @@ def build_model(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if scope == "edge" and encoder_type is None:
+    if encoder_type is None and scope == "edge":
         raise ValueError(
-            "Edge-level prediction (scope='edge') requires a graph encoder "
-            "(encoder_type='gnn' or 'egnn'). A pure MLP encoder has no edge structure."
+            "Encoder-free models (encoder_type=None) cannot use scope='edge': "
+            "precomputed features carry no bond structure. Use a graph encoder "
+            "(encoder_type='gnn' or 'egnn') for edge-level targets."
+        )
+    # scope='node' is permitted here and validated at the first forward instead:
+    # it is well posed with PER-ATOM features (one prediction per atom) but not
+    # with pooled ones, and build time cannot tell the two apart.
+
+    if encoder_type is None and readout_type not in ("mlp", "transformer"):
+        raise ValueError(
+            f"Encoder-free models (encoder_type=None) support readout_type='mlp' or "
+            f"'transformer', got readout_type='{readout_type}'. "
+            "'edge_predictor' needs edge structure that precomputed features do not "
+            "carry."
         )
 
     if encoder_type is None:
@@ -740,7 +777,32 @@ class Model(nn.Module):
                 # for node-level prediction, restrict output to subgraph nodes if defined
                 x, batch = self.subselect_node_embeddings(x, data)
         else:
-            x, embeddings = data, data
+            # encoder-free model: features are precomputed rather than message-passed.
+            # Graph-level features give one row per sample; per-atom features give
+            # n_atoms rows. Pooling handles both — with one row per sample it is the
+            # identity, so this is safe for graph-level features too.
+            x, embeddings = data.x, data.x
+            if self.scope == "graph":
+                pool_fn = POOL_MAP[self.pooling]
+            if self.scope == "node" and x.size(0) == data.num_graphs:
+                raise ValueError(
+                    "scope='node' with encoder_type=None requires per-atom "
+                    f"features, but x has {x.size(0)} rows for {data.num_graphs} "
+                    "samples — one vector each. Pooled features cannot produce "
+                    "per-atom predictions. Supply feature_offsets_path alongside "
+                    "feature_data_path to keep per-atom resolution."
+                )
+            if isinstance(self.readout, Transformer) and x.size(0) == data.num_graphs:
+                raise ValueError(
+                    "Transformer readout with encoder_type=None requires per-atom "
+                    f"features, but x has {x.size(0)} rows for {data.num_graphs} "
+                    "samples — one vector each. The transformer attends over atoms, "
+                    "so with a sequence length of 1 attention is a no-op and the "
+                    "model silently degenerates to an MLP carrying unused attention "
+                    "parameters. Either supply per-atom features (pass "
+                    "feature_offsets_path alongside feature_data_path) or use "
+                    "readout_type='mlp'."
+                )
 
         # extract graph-level attributes for concatenation after pooling
         graph_attr = getattr(data, "graph_attr", None)
