@@ -10,15 +10,17 @@ from elemenet.readout import (
     EdgePredictorConfig,
     TransformerConfig,
 )
-from elemenet.encoder import GNN_Encoder, EGNN_Encoder, GNNConfig, EGNNConfig
+from elemenet.encoder import (GNN_Encoder, EGNN_Encoder, OrbitalEGNN_Encoder,
+                              GNNConfig, EGNNConfig, OrbitalEGNNConfig)
 from dataclasses import asdict, is_dataclass
 
 
 ENCODER_CONFIG_MAP = {
     "gnn": GNNConfig,
     "egnn": EGNNConfig,
+    "orbital_egnn": OrbitalEGNNConfig,
 }
-ENCODER_CONFIGS = Union[GNNConfig, EGNNConfig]
+ENCODER_CONFIGS = Union[GNNConfig, EGNNConfig, OrbitalEGNNConfig]
 
 READOUT_CONFIG_MAP = {
     "mlp": MLPConfig,
@@ -30,6 +32,10 @@ READOUT_CONFIGS = Union[MLPConfig, EdgePredictorConfig, TransformerConfig]
 ENCODER_MAP = {
     "gnn": GNN_Encoder,
     "egnn": EGNN_Encoder,
+    # Additive: an EGNN that also carries a per-shell state. With its default
+    # shell_layers=0 it is byte-for-byte equivalent to "egnn"; no existing
+    # encoder type, config or default is altered by its presence.
+    "orbital_egnn": OrbitalEGNN_Encoder,
 }
 
 READOUT_MAP = {
@@ -101,13 +107,13 @@ def build_encoder_config(encoder_type: str, params: dict):
             gat_concat=encoder_config.get("gat_concat"),
         )
 
-    elif encoder_type == "egnn":
+    elif encoder_type in ("egnn", "orbital_egnn"):
         cutoff = encoder_config.get("cutoff", 10.0)
         if cutoff <= 0:
             raise ValueError(
                 f"EGNN cutoff must be a positive number. Received cutoff={cutoff}"
             )
-        return EGNNConfig(
+        common = dict(
             input_size=input_size,
             hidden_sizes=hidden_sizes,
             edge_dim=edge_dim,
@@ -125,6 +131,18 @@ def build_encoder_config(encoder_type: str, params: dict):
             tanh=encoder_config.get("tanh", False),
             coords_range=encoder_config.get("coords_range", 15),
             use_norm=encoder_config.get("use_norm", False),
+        )
+        if encoder_type == "egnn":
+            return EGNNConfig(**common)
+        # orbital_egnn: every EGNN field above, plus the shell-level ones.
+        # shell_layers defaults to 0, which reproduces EGNN exactly.
+        return OrbitalEGNNConfig(
+            **common,
+            shell_layers=encoder_config.get("shell_layers", 0),
+            shell_hidden=encoder_config.get("shell_hidden"),
+            shell_embedding_dim=encoder_config.get("shell_embedding_dim", 16),
+            max_shell_am=encoder_config.get("max_shell_am", 3),
+            max_shell_radial=encoder_config.get("max_shell_radial", 8),
         )
 
 

@@ -450,3 +450,180 @@ class EGNN_Encoder(nn.Module):
         # Important, the bias of the last linear might be non-zero
         h = self.embedding_out(h)
         return h, h
+
+@dataclass
+class OrbitalEGNNConfig(EGNNConfig):
+    """Configuration for the orbital-aware EGNN encoder.
+
+    Every field of :class:`EGNNConfig` is inherited unchanged, so an
+    ``OrbitalEGNN_Encoder`` configured with only EGNN fields behaves exactly
+    like ``EGNN_Encoder``.
+
+    Attributes
+    ----------
+    shell_layers : int
+        Rounds of shell-level refinement after the atom-level EGNN. ``0``
+        disables the orbital path entirely and reproduces ``EGNN_Encoder``.
+        Default 0.
+    shell_hidden : Optional[int]
+        Width of the shell feature vectors. Defaults to the atom hidden size.
+    shell_embedding_dim : int
+        Width of the (angular momentum, radial index) shell-identity embedding.
+        Default 16.
+    max_shell_am : int
+        Largest angular momentum a shell may carry. Default 3 (f).
+    max_shell_radial : int
+        Largest radial index within one angular momentum. Default 8.
+    """
+
+    shell_layers: int = 0
+    shell_hidden: Optional[int] = None
+    shell_embedding_dim: int = 16
+    max_shell_am: int = 3
+    max_shell_radial: int = 8
+
+
+class OrbitalEGNN_Encoder(nn.Module):
+    """EGNN that additionally carries a learned state per BASIS-SET SHELL.
+
+    Motivation.  In the plain EGNN every atom is a single invariant vector, and
+    anything shell-resolved has to be produced in one shot by the readout.  For
+    density-matrix prediction that was measured to be the binding constraint: a
+    4.3x parameter increase lowered training error by only 6.6%, and the
+    train/validation gap stayed flat at 0.0235, so the model was neither
+    capacity- nor data-limited.  Giving each shell its own state, refined by
+    message passing, is the targeted response.
+
+    Two levels, deliberately:
+
+    * ATOM level -- the unmodified EGNN, which carries long-range information
+      and equivariant coordinate updates at ~35 nodes per complex.
+    * SHELL level -- one node per basis-set shell (~150-400 per complex),
+      initialised from its parent atom's features plus an embedding of
+      (angular momentum, radial index), then refined along the SAME atom-level
+      edges.  Messages travel atom-to-atom, so edge count is unchanged; only
+      the per-node state is richer.  A shell-resolved all-pairs message would
+      be ~121x more edges and is deliberately not done here.
+
+    Shell features are INVARIANT scalars, exactly like the atom features h.
+    Equivariance continues to come from the downstream head, so this encoder
+    cannot break it.
+
+    DEFAULTS ARE UNCHANGED.  With ``shell_layers=0`` (the default) no orbital
+    machinery is constructed and ``forward`` returns exactly what
+    ``EGNN_Encoder.forward`` returns.  The orbital path activates only when
+    ``shell_layers > 0`` AND the batch actually carries shell assignments.
+    """
+
+    def __init__(
+        self,
+        input_size,
+        hidden_sizes,
+        cutoff=None,
+        shell_layers=0,
+        shell_hidden=None,
+        shell_embedding_dim=16,
+        max_shell_am=3,
+        max_shell_radial=8,
+        **kwargs,
+    ):
+        super().__init__()
+        self.atom_encoder = EGNN_Encoder(
+            input_size=input_size, hidden_sizes=hidden_sizes, cutoff=cutoff,
+            **kwargs
+        )
+        self.output_size = self.atom_encoder.output_size
+        self.cutoff = cutoff
+        self.shell_layers = int(shell_layers)
+        d_atom = hidden_sizes[-1]
+        d_shell = int(shell_hidden or d_atom)
+        self.shell_hidden = d_shell
+
+        if self.shell_layers <= 0:
+            return
+
+        self.am_embedding = nn.Embedding(max_shell_am + 1, shell_embedding_dim)
+        self.radial_embedding = nn.Embedding(max_shell_radial + 1,
+                                             shell_embedding_dim)
+        self.shell_init = nn.Sequential(
+            nn.Linear(d_atom + 2 * shell_embedding_dim, d_shell), nn.SiLU(),
+            nn.Linear(d_shell, d_shell),
+        )
+        self.distance_rbf = GaussianSmearing(
+            0.0, cutoff if cutoff else 10.0, kwargs.get("num_gaussians", 64)
+        )
+        n_rbf = kwargs.get("num_gaussians", 64)
+        self.shell_message = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(2 * d_shell + n_rbf, d_shell), nn.SiLU(),
+                nn.Linear(d_shell, d_shell),
+            ) for _ in range(self.shell_layers)
+        ])
+        self.shell_update = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(2 * d_shell + d_atom, d_shell), nn.SiLU(),
+                nn.Linear(d_shell, d_shell),
+            ) for _ in range(self.shell_layers)
+        ])
+        self.shell_norms = nn.ModuleList([
+            nn.LayerNorm(d_shell) for _ in range(self.shell_layers)
+        ])
+
+    def forward(self, data):
+        """Atom-level output, matching ``EGNN_Encoder.forward`` exactly.
+
+        Returns ``(h, h)`` so this encoder is a drop-in wherever an
+        ``EGNN_Encoder`` is used; the shell features are reached through
+        :meth:`forward_shells`.
+        """
+        return self.atom_encoder(data)
+
+    def forward_shells(self, data):
+        """Return ``(h_atom, s_shell)``.
+
+        ``s_shell`` is ``None`` when the orbital path is disabled or the batch
+        carries no shell assignment, so callers can fall back cleanly.
+
+        The batch supplies:
+          ``data.shell_atom_index`` : (n_shell,) parent atom of each shell
+          ``data.shell_am``         : (n_shell,) angular momentum
+          ``data.shell_radial``     : (n_shell,) radial index within that am
+        """
+        h, _ = self.atom_encoder(data)
+        if self.shell_layers <= 0:
+            return h, None
+        idx = getattr(data, "shell_atom_index", None)
+        if idx is None:
+            return h, None
+
+        am = data.shell_am.long()
+        radial = data.shell_radial.long().clamp_max(
+            self.radial_embedding.num_embeddings - 1)
+        s = self.shell_init(torch.cat(
+            [h[idx], self.am_embedding(am.clamp_max(
+                self.am_embedding.num_embeddings - 1)),
+             self.radial_embedding(radial)], dim=-1))
+
+        x = data.coords
+        if self.cutoff is not None:
+            edge_index = radius_graph(x, r=self.cutoff, batch=data.batch,
+                                      max_num_neighbors=32)
+        else:
+            edge_index = data.edge_index
+        row, col = edge_index
+        dist = (x[row] - x[col]).norm(dim=-1, keepdim=True)
+        edge_rbf = self.distance_rbf(dist.squeeze(-1))
+
+        # Atom-level pooled shell state, so a shell sees its neighbours'
+        # orbital content without paying for all-pairs shell edges.
+        for layer in range(self.shell_layers):
+            pooled = torch.zeros(h.shape[0], s.shape[1], device=s.device,
+                                 dtype=s.dtype).index_add_(0, idx, s)
+            msg = self.shell_message[layer](
+                torch.cat([pooled[row], pooled[col], edge_rbf], dim=-1))
+            agg = torch.zeros_like(pooled).index_add_(0, row, msg)
+            s = s + self.shell_update[layer](
+                torch.cat([s, agg[idx], h[idx]], dim=-1))
+            s = self.shell_norms[layer](s)
+        return h, s
+
