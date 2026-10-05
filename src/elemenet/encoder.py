@@ -559,9 +559,11 @@ class OrbitalEGNN_Encoder(nn.Module):
                 nn.Linear(d_shell, d_shell),
             ) for _ in range(self.shell_layers)
         ])
+        # 3 * d_shell: the shell's own state, its own ATOM's pooled shell state
+        # (sibling coupling), and the neighbour aggregate.
         self.shell_update = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(2 * d_shell + d_atom, d_shell), nn.SiLU(),
+                nn.Linear(3 * d_shell + d_atom, d_shell), nn.SiLU(),
                 nn.Linear(d_shell, d_shell),
             ) for _ in range(self.shell_layers)
         ])
@@ -622,8 +624,15 @@ class OrbitalEGNN_Encoder(nn.Module):
             msg = self.shell_message[layer](
                 torch.cat([pooled[row], pooled[col], edge_rbf], dim=-1))
             agg = torch.zeros_like(pooled).index_add_(0, row, msg)
+            # pooled[idx] is the shell's OWN atom's pooled shell state, which
+            # couples siblings directly.  Without it, two shells on the same
+            # atom can only reach each other by travelling out to a neighbour
+            # atom and back -- and on an isolated atom they never couple at all.
+            # Intra-atomic shell coupling is exactly what an on-site block
+            # (s-d, p-d on one centre) is made of, so it must not be an
+            # afterthought of the neighbour path.
             s = s + self.shell_update[layer](
-                torch.cat([s, agg[idx], h[idx]], dim=-1))
+                torch.cat([s, pooled[idx], agg[idx], h[idx]], dim=-1))
             s = self.shell_norms[layer](s)
         return h, s
 
