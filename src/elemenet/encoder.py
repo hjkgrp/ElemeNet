@@ -98,6 +98,15 @@ class EGNNConfig:
         block. Bounds the node-feature residual stream so it cannot compound to
         fp32 overflow in deep stacks. Coordinate-features are never normalized
         (that would break E(3) equivariance). Default False.
+    max_num_neighbors : Optional[int]
+        Maximum number of neighbours kept per atom when the radius graph is
+        built from ``cutoff``. Default 32 (bounds memory on dense graphs).
+        ``None`` keeps every pair inside the cutoff. When the cap binds (an
+        atom has more than this many neighbours inside the cutoff) the
+        neighbours that are kept are NOT the nearest ones and depend on atom
+        ordering, so the model is no longer exactly invariant to atom
+        renumbering or, on CPU, to rotation; raise the cap or set ``None``
+        when that matters.
     """
 
     input_size: int
@@ -116,6 +125,7 @@ class EGNNConfig:
     aggregation_method: str = "sum"
     num_gaussians: int = 64
     use_norm: bool = False
+    max_num_neighbors: Optional[int] = 32
 
 
 class GNN_Encoder(nn.Module):
@@ -271,6 +281,17 @@ class GNN_Encoder(nn.Module):
         return x, x
 
 
+def _neighbor_cap(encoder, x):
+    """``max_num_neighbors`` for ``radius_graph``.
+
+    Encoders pickled before the option existed have no such attribute and get
+    the 32 they were trained with. ``None`` means uncapped: no atom can have
+    more neighbours than there are atoms in the batch.
+    """
+    cap = getattr(encoder, "max_num_neighbors", 32)
+    return int(x.shape[0]) if cap is None else int(cap)
+
+
 class EGNN_Encoder(nn.Module):
     """
     E(3)-equivariant graph neural network encoder.
@@ -337,6 +358,7 @@ class EGNN_Encoder(nn.Module):
         num_gaussians=64,
         use_norm=False,
         dropouts=None,
+        max_num_neighbors=32,
         **kwargs,
     ):
         super().__init__()
@@ -346,6 +368,8 @@ class EGNN_Encoder(nn.Module):
         out_node_nf = hidden_sizes[-1]
         self.output_size = out_node_nf
         self.cutoff = cutoff
+        # None = no cap (every pair inside the cutoff). Default 32, as before.
+        self.max_num_neighbors = max_num_neighbors
         if dropouts is None:
             dropouts = [0.0] * len(hidden_sizes)
         if self.cutoff is not None:
@@ -419,7 +443,8 @@ class EGNN_Encoder(nn.Module):
 
         if self.cutoff is not None:
             edge_index = radius_graph(
-                x, r=self.cutoff, batch=data.batch, max_num_neighbors=32
+                x, r=self.cutoff, batch=data.batch,
+                max_num_neighbors=_neighbor_cap(self, x),
             )
             edge_attr = None
         else:
@@ -608,8 +633,9 @@ class OrbitalEGNN_Encoder(nn.Module):
 
         x = data.coords
         if self.cutoff is not None:
-            edge_index = radius_graph(x, r=self.cutoff, batch=data.batch,
-                                      max_num_neighbors=32)
+            edge_index = radius_graph(
+                x, r=self.cutoff, batch=data.batch,
+                max_num_neighbors=_neighbor_cap(self.atom_encoder, x))
         else:
             edge_index = data.edge_index
         row, col = edge_index

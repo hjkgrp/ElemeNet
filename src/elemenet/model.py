@@ -131,6 +131,8 @@ def build_encoder_config(encoder_type: str, params: dict):
             tanh=encoder_config.get("tanh", False),
             coords_range=encoder_config.get("coords_range", 15),
             use_norm=encoder_config.get("use_norm", False),
+            # neighbour cap of the radius graph; None = uncapped
+            max_num_neighbors=encoder_config.get("max_num_neighbors", 32),
         )
         if encoder_type == "egnn":
             return EGNNConfig(**common)
@@ -293,6 +295,7 @@ def invert_encoder_config(config_obj, encoder_type: str):
         encoder_config["tanh"] = cfg.get("tanh", False)
         encoder_config["coords_range"] = cfg.get("coords_range", 15)
         encoder_config["use_norm"] = cfg.get("use_norm", False)
+        encoder_config["max_num_neighbors"] = cfg.get("max_num_neighbors", 32)
 
     return {
         "encoder_type": encoder_type,

@@ -64,7 +64,8 @@ def _patch_legacy_encoder_attrs(encoder):
     """
     if encoder is None:
         return
-    for attr, default in (("use_norm", False), ("h_norms", None)):
+    for attr, default in (("use_norm", False), ("h_norms", None),
+                          ("max_num_neighbors", 32)):
         if not hasattr(encoder, attr):
             setattr(encoder, attr, default)
 
