@@ -58,13 +58,16 @@ def _patch_legacy_encoder_attrs(encoder):
     reproduces how those models were actually trained: no normalization was
     applied because the code path did not exist.
 
+    ``graph_attr_dim`` (graph attributes appended to the node features) is read
+    the same way by both encoders; 0 means none were appended.
+
     Note this is only needed for the pickled-instance path used here. Resuming
     or seeding training (``training.py``) rebuilds the encoder from
     ``model_config`` with the current class, so it already has these fields.
     """
     if encoder is None:
         return
-    for attr, default in (("use_norm", False), ("h_norms", None)):
+    for attr, default in (("use_norm", False), ("h_norms", None), ("graph_attr_dim", 0)):
         if not hasattr(encoder, attr):
             setattr(encoder, attr, default)
 

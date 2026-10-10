@@ -89,6 +89,19 @@ def build_encoder_config(encoder_type: str, params: dict):
     convolutions = make_list(encoder_config.get("convolution", "graphconv"), gnn_layers)
     dropouts = make_list(encoder_config.get("dropout", 0.1), gnn_layers)
 
+    # optionally append the graph-level attributes (e.g. charge, spin) to every node's
+    # input features, so message passing sees them rather than only the readout.
+    # Off by default; the width is the data-inferred one the readout already uses.
+    graph_attr_dim = 0
+    if encoder_config.get("graph_attr_to_nodes", False):
+        graph_attr_dim = (params.get("readout_config") or {}).get("graph_attr_dim", 0)
+        if graph_attr_dim == 0:
+            raise ValueError(
+                "encoder_config['graph_attr_to_nodes']=True appends graph-level "
+                "attributes to the node features, but the data has none. Provide them "
+                "with feature_columns={'graph': [...]} (e.g. ['charge', 'spinmult'])."
+            )
+
     if encoder_type == "gnn":
         return GNNConfig(
             input_size=input_size,
@@ -99,6 +112,7 @@ def build_encoder_config(encoder_type: str, params: dict):
             edge_dim=edge_dim,
             gat_heads=encoder_config.get("gat_heads"),
             gat_concat=encoder_config.get("gat_concat"),
+            graph_attr_dim=graph_attr_dim,
         )
 
     elif encoder_type == "egnn":
@@ -125,6 +139,7 @@ def build_encoder_config(encoder_type: str, params: dict):
             tanh=encoder_config.get("tanh", False),
             coords_range=encoder_config.get("coords_range", 15),
             use_norm=encoder_config.get("use_norm", False),
+            graph_attr_dim=graph_attr_dim,
         )
 
 
@@ -248,6 +263,7 @@ def invert_encoder_config(config_obj, encoder_type: str):
     encoder_config = {
         "input_size": cfg["input_size"],
         "edge_dim": cfg["edge_dim"],
+        "graph_attr_to_nodes": cfg.get("graph_attr_dim", 0) > 0,
         **inferred,
     }
 

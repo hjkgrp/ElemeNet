@@ -39,6 +39,9 @@ class GNNConfig:
     gat_concat : Optional[bool]
         If True, concatenate multi-head outputs; if False, average them.
         Broadcast to all layers if a single bool. Default None (True).
+    graph_attr_dim : int
+        Number of graph-level attributes (e.g. charge, spin) appended to every
+        node's input features. Default 0 (none).
     """
 
     input_size: int
@@ -49,6 +52,7 @@ class GNNConfig:
     edge_dim: Optional[int] = None
     gat_heads: Optional[int] = None
     gat_concat: Optional[bool] = None
+    graph_attr_dim: int = 0
 
 
 @dataclass
@@ -98,6 +102,9 @@ class EGNNConfig:
         block. Bounds the node-feature residual stream so it cannot compound to
         fp32 overflow in deep stacks. Coordinate-features are never normalized
         (that would break E(3) equivariance). Default False.
+    graph_attr_dim : int
+        Number of graph-level attributes (e.g. charge, spin) appended to every
+        node's input features. Default 0 (none).
     """
 
     input_size: int
@@ -116,6 +123,16 @@ class EGNNConfig:
     aggregation_method: str = "sum"
     num_gaussians: int = 64
     use_norm: bool = False
+    graph_attr_dim: int = 0
+
+
+def append_graph_attr(x, data):
+    """Append each graph's attributes (e.g. charge, spin) to all of its nodes' features.
+
+    Uses ``data.graph_attr`` as-is, so nodes see exactly the scaled values the
+    readout receives.
+    """
+    return torch.cat([x, data.graph_attr[data.batch]], dim=-1)
 
 
 class GNN_Encoder(nn.Module):
@@ -141,6 +158,9 @@ class GNN_Encoder(nn.Module):
         gat_concat: list of bool
             Whether to concatenate or average multi-head-attentions in each hidden layer for GAT architecture.
             default=None
+        graph_attr_dim: int
+            Number of graph-level attributes appended to every node's input features.
+            default=0
     """
 
     def __init__(
@@ -153,6 +173,7 @@ class GNN_Encoder(nn.Module):
         edge_dim=None,
         gat_heads=None,
         gat_concat=None,
+        graph_attr_dim=0,
         **kwargs,
     ):
         super().__init__()
@@ -165,7 +186,8 @@ class GNN_Encoder(nn.Module):
         self.activations = nn.ModuleList()
         self.dropouts = nn.ModuleList()
         self.edge_dim = edge_dim
-        in_dim = input_size
+        self.graph_attr_dim = graph_attr_dim
+        in_dim = input_size + graph_attr_dim
         # configure GAT parameters
         if gat_heads is None:
             gat_heads = [1] * num_layers
@@ -237,6 +259,8 @@ class GNN_Encoder(nn.Module):
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
+        if self.graph_attr_dim > 0:
+            x = append_graph_attr(x, data)
         edge_attr = getattr(data, "edge_attr", None)
 
         for idx, conv in enumerate(self.convolutions):
@@ -316,6 +340,9 @@ class EGNN_Encoder(nn.Module):
             default=64
         dropouts: list of float
             Dropout rate to use in each hidden layer.
+        graph_attr_dim: int
+            Number of graph-level attributes appended to every node's input features.
+            default=0
     """
     
     def __init__(
@@ -337,6 +364,7 @@ class EGNN_Encoder(nn.Module):
         num_gaussians=64,
         use_norm=False,
         dropouts=None,
+        graph_attr_dim=0,
         **kwargs,
     ):
         super().__init__()
@@ -379,7 +407,8 @@ class EGNN_Encoder(nn.Module):
             self.distance_embedding = None
             edge_feat_nf = 2 + edge_dim  # distance (x0 and xl) + edge_attr
 
-        self.embedding = nn.Linear(input_size, hidden_size)
+        self.graph_attr_dim = graph_attr_dim
+        self.embedding = nn.Linear(input_size + graph_attr_dim, hidden_size)
         self.embedding_out = nn.Linear(hidden_size, out_node_nf)
         # optional LayerNorm on the invariant node features after each block;
         # bounds the residual stream so |h| cannot compound to fp32 overflow.
@@ -416,6 +445,8 @@ class EGNN_Encoder(nn.Module):
 
     def forward(self, data):
         h, x = data.x, data.coords
+        if self.graph_attr_dim > 0:
+            h = append_graph_attr(h, data)
 
         if self.cutoff is not None:
             edge_index = radius_graph(
