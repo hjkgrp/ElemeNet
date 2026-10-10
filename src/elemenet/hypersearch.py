@@ -49,7 +49,7 @@ _TRIAL_PG_TIMEOUT = timedelta(seconds=120)
 _TUNABLE_ENCODER_KEYS = {
     "layers", "neurons", "dropout", "activation", "convolution", "shape",
     "inv_sublayers", "num_gaussians", "attention", "distance_embedding",
-    "aggregation_method",
+    "aggregation_method", "graph_attr_to_nodes",
 }
 _TUNABLE_READOUT_KEYS = {
     "layers", "neurons", "dropout", "activation", "shape", "use_norm",
@@ -589,7 +589,7 @@ def search_space_readout(trial, quicksearch=False, readout_type="mlp", scope="gr
     return trial_params
 
 
-def search_space_encoder(trial, quicksearch=False, encoder_type="gnn", fixed=None):
+def search_space_encoder(trial, quicksearch=False, encoder_type="gnn", fixed=None, has_graph_attr=False):
     fixed = fixed or {}
     if quicksearch:
         layers = _maybe_suggest(trial, fixed, "layers",
@@ -719,6 +719,14 @@ def search_space_encoder(trial, quicksearch=False, encoder_type="gnn", fixed=Non
                     lambda: trial.suggest_float(
                         "encoder_coords_range", 1.0, 20.0
                     ))
+
+    # appending graph attributes (e.g. charge, spin) to the node features needs
+    # the data to have them, so it is only searched when it does
+    if encoder_type in ("gnn", "egnn") and has_graph_attr and not quicksearch:
+        trial_params["graph_attr_to_nodes"] = _maybe_suggest(trial, fixed, "graph_attr_to_nodes",
+            lambda: trial.suggest_categorical(
+                "encoder_graph_attr_to_nodes", [True, False]
+            ))
     return trial_params
 
 
@@ -775,7 +783,8 @@ def search_space(trial, encoder_type, readout_type, scope, quicksearch=False, fi
         trial_params["encoder_config"] = {}
     else:
         trial_params["encoder_config"] = search_space_encoder(
-            trial, quicksearch=quicksearch, encoder_type=encoder_type, fixed=fixed_encoder
+            trial, quicksearch=quicksearch, encoder_type=encoder_type, fixed=fixed_encoder,
+            has_graph_attr=(fixed_readout.get("graph_attr_dim") or 0) > 0,
         )
 
     trial_params["readout_config"] = search_space_readout(
