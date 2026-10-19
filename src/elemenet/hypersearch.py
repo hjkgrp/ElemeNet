@@ -177,16 +177,16 @@ def optimize(
         )
 
         # estimate memory in GB
-        est_mem, gpu_ram = estimate_training_memory(trial_params, batch_size)
-        if est_mem > gpu_ram:
+        est_mem, device_ram = estimate_training_memory(trial_params, batch_size, device=device)
+        if est_mem > device_ram:
             print(
                 f"\nTrial {current_trial}: SKIPPED — estimated memory "
-                f"{est_mem:.1f} GB exceeds GPU capacity {gpu_ram:.1f} GB"
+                f"{est_mem:.1f} GB exceeds device memory {device_ram:.1f} GB"
             )
             if _distributed:
                 dist.broadcast_object_list([{"action": "skip"}], src=0)
             raise optuna.TrialPruned(
-                f"Estimated memory {est_mem:.1f} GB exceeds GPU capacity {gpu_ram:.1f} GB"
+                f"Estimated memory {est_mem:.1f} GB exceeds device memory {device_ram:.1f} GB"
             )
 
         for key in fixed_params:
