@@ -1768,6 +1768,22 @@ def mol_to_graph(
         bond_scale_factor=bond_scale_factor,
     )
 
+    # a bond listed twice, or an atom bonded to itself, has no single edge for an
+    # edge-level target to belong to
+    seen_pairs = set()
+    for atom1, atom2, _ in bonds:
+        if atom1 == atom2:
+            raise ValueError(
+                f"Invalid bond list: atom {atom1 + 1} (numbered from 1) is bonded to itself."
+            )
+        pair = (min(atom1, atom2), max(atom1, atom2))
+        if pair in seen_pairs:
+            raise ValueError(
+                f"Invalid bond list: atoms {pair[0] + 1} and {pair[1] + 1} (numbered "
+                f"from 1) are bonded more than once."
+            )
+        seen_pairs.add(pair)
+
     # capture original (pre-filter) atom and bond counts so data.py can correctly
     # discriminate node-level vs edge-level targets when applying implicit_Hs filtering
     original_n_atoms = len(syms)
@@ -1889,7 +1905,7 @@ def mol_to_graph(
     # edges follow the input bond order (edge k = bond k), stored as (lower, higher)
     # atom pairs, so edge-level targets and per-bond features line up with edge_index
     edge_pairs = []
-    edge_features_by_pair = {}
+    edge_features_list = []
     for bond_idx, bond in enumerate(bonds):
         atom1, atom2, bond_type = bond
         # extract features for this specific bond from the dict of lists
@@ -1907,18 +1923,16 @@ def mol_to_graph(
             extra_feature_dict=extra_feature_dict,
         )
         mol.add_edge(atom1, atom2, **edge_features)
-        pair = (min(atom1, atom2), max(atom1, atom2))
-        if pair not in edge_features_by_pair:
-            edge_pairs.append(pair)
-        edge_features_by_pair[pair] = edge_features
+        edge_pairs.append((min(atom1, atom2), max(atom1, atom2)))
+        edge_features_list.append(edge_features)
 
     # Handle edge_index creation, accounting for molecules with no edges (disconnected atoms)
     # This is valid for sparse/disconnected molecular graphs
     if len(edge_pairs) > 0:
         edge_index = torch.tensor(edge_pairs).t().contiguous()
         edge_attr = [
-            [edge_features_by_pair[pair][feature] for feature in edge_features.keys()]
-            for pair in edge_pairs
+            [features[feature] for feature in edge_features.keys()]
+            for features in edge_features_list
         ]
         edge_attr = torch.tensor(edge_attr, dtype=torch.float)
     else:

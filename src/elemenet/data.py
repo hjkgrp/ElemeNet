@@ -824,8 +824,8 @@ class DataModule:
                         else None
                     )
 
-                    data_.append(
-                        mol_to_graph(
+                    try:
+                        graph = mol_to_graph(
                             mol,
                             graph_format,
                             edge_invariant,
@@ -841,7 +841,10 @@ class DataModule:
                             implicit_Hs=implicit_Hs,
                             rdkit_features=rdkit_features,
                         )
-                    )
+                    except ValueError as e:
+                        where = f"data row {i + 1}" + ("" if single_source else f" of the {split} split")
+                        raise ValueError(f"Could not build the graph for {where}: {e}") from e
+                    data_.append(graph)
             X_splits.append(data_)
             if feature_columns and encoder_type in ("gnn", "egnn"):
                 if not extra_features["node"].empty:
