@@ -438,11 +438,18 @@ class Trainer:
         if self.distributed:
             dist.barrier(group=self.process_group)
 
+        # a resumed run that never beat its earlier best is evaluated with that best
+        # checkpoint, the one inference loads
+        if early_stopping and best_checkpoint_path is None and save_dir and start_epoch > 0:
+            if os.path.exists(os.path.join(checkpoint_dir, "best.pt")):
+                best_checkpoint_path = os.path.join(checkpoint_dir, "best.pt")
+
         # return early-stopped model
         if early_stopping and best_checkpoint_path is not None:
             checkpoint = torch.load(
                 best_checkpoint_path, map_location=self.device, weights_only=False
             )
+            best_epoch = checkpoint["epoch"]
             # checkpoint always holds the raw (non-DDP) state_dict; load into the
             # underlying module so the same file works for single- and multi-GPU runs.
             if self.distributed:
@@ -547,14 +554,19 @@ class Trainer:
                 num_epochs_run = len(train_loss_list)
                 loss_summary = pd.DataFrame(
                     {
-                        "epoch": list(range(num_epochs_run)),
+                        "epoch": list(range(start_epoch, start_epoch + num_epochs_run)),
                         "training_loss": train_loss_list,
                         "validation_loss": val_loss_list,
                     }
                 )
-                loss_summary.to_csv(
-                    os.path.join(stats_dir, "loss_summary.csv"), index=False
-                )
+                summary_path = os.path.join(stats_dir, "loss_summary.csv")
+                # on resume, keep the earlier epochs' losses if the file has all of them
+                if start_epoch > 0 and os.path.exists(summary_path):
+                    earlier = pd.read_csv(summary_path)
+                    earlier = earlier[earlier["epoch"] < start_epoch]
+                    if earlier["epoch"].tolist() == list(range(start_epoch)):
+                        loss_summary = pd.concat([earlier, loss_summary], ignore_index=True)
+                loss_summary.to_csv(summary_path, index=False)
                 print(f"Training and validation loss saved to {stats_dir}/loss_summary.csv")
 
                 # save training embeddings for inference-time uncertainty (graph-level only)
