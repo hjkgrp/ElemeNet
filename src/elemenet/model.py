@@ -213,7 +213,6 @@ def build_readout_config(readout_type: str, params: dict):
             activations=activations,
             dropouts=dropouts,
             ensemble_size=ensemble_size,
-            max_nodes=readout_config.get("max_nodes"),
             num_heads=readout_config.get("num_heads", 8),
             expansion=readout_config.get("expansion", 4),
             graph_attr_dim=graph_attr_dim,
@@ -365,7 +364,6 @@ def invert_readout_config(config_obj, readout_type: str):
         }
 
     elif readout_type == "transformer":
-        readout_config["max_nodes"] = cfg.get("max_nodes")
         readout_config["num_heads"] = cfg.get("num_heads", 8)
         readout_config["expansion"] = cfg.get("expansion", 4)
         readout_config["graph_attr_hidden_dim"] = cfg.get("graph_attr_hidden_dim", None)

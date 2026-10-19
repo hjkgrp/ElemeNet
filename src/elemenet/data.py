@@ -924,8 +924,6 @@ class DataModule:
             self.target_column = data["target_column"]
             self.label_column = data["label_column"]
             self.num_classes = data["num_classes"]
-            self.max_nodes = data["max_nodes"]
-            self.max_edges = data["max_edges"]
             self.classes = data.get("classes", None)
             self.class_to_idx = (
                 {int(c): i for i, c in enumerate(self.classes)}
@@ -986,8 +984,6 @@ class DataModule:
 
             self.target_column = target_column
             self.label_column = label_column
-            self.max_nodes = self.get_max_num_nodes()
-            self.max_edges = self.get_max_num_edges()
 
             torch.save(
                 {
@@ -995,8 +991,6 @@ class DataModule:
                     "target_column": self.target_column,
                     "label_column": self.label_column,
                     "num_classes": self.num_classes,
-                    "max_nodes": self.max_nodes,
-                    "max_edges": self.max_edges,
                     "classes": self.classes,
                 },
                 save_path,
@@ -1039,27 +1033,6 @@ class DataModule:
     def test_labels(self):
         return [l for g in self.graphs_splits[2] for l in g.label]
 
-    def get_max_num_nodes(self):
-        """Return the maximum number of nodes across all graphs in all splits."""
-        max_num_nodes = 0
-        for split in self.graphs_splits:
-            for graph in split:
-                num_nodes = graph.x.shape[0]
-                if num_nodes > max_num_nodes:
-                    max_num_nodes = num_nodes
-        return max_num_nodes
-
-    def get_max_num_edges(self):
-        """Return the maximum number of edges across all graphs in all splits."""
-        max_num_edges = 0
-        for split in self.graphs_splits:
-            for graph in split:
-                edge_index = getattr(graph, "edge_index", None)
-                num_edges = 0 if edge_index is None else edge_index.shape[1]
-                if num_edges > max_num_edges:
-                    max_num_edges = num_edges
-        return max_num_edges
-
     def infer_model_input_output_size(self):
         """Infer encoder/readout input and output sizes from the processed training data.
 
@@ -1074,8 +1047,7 @@ class DataModule:
         dict
             Nested dict with keys ``'readout_config'`` (sub-keys:
             ``input_size``, ``output_size``, ``graph_attr_dim``, ``edge_dim``)
-            and ``'encoder_config'`` (sub-keys: ``input_size``, ``edge_dim``,
-            ``max_nodes``, ``max_edges``).
+            and ``'encoder_config'`` (sub-keys: ``input_size``, ``edge_dim``).
         """
         # in case that gnn is used as encoder, mlp_input_size will be overwritten later.
         X_train = self.graphs_splits[0][0]
@@ -1103,8 +1075,6 @@ class DataModule:
             "encoder_config": {
                 "input_size": gnn_input_size,
                 "edge_dim": edge_dim,
-                "max_nodes": self.max_nodes,
-                "max_edges": self.max_edges,
             },
         }
 

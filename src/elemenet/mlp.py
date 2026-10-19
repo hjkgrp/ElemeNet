@@ -474,9 +474,9 @@ class AttentionWithNodeMask(nn.Module):
     """Multi-head self-attention that respects a node padding mask.
 
     Standard scaled dot-product attention, extended to handle variable-length
-    graphs padded to a fixed ``max_nodes`` size. The ``node_mask`` is expanded
-    into a 2-D attention mask so padded nodes neither attend to nor receive
-    attention from real nodes.
+    graphs padded to the size of the largest graph in the batch. The
+    ``node_mask`` is expanded into a 2-D attention mask so padded nodes neither
+    attend to nor receive attention from real nodes.
 
     Parameters
     ----------
