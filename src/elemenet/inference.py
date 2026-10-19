@@ -152,7 +152,8 @@ def inference_pipeline(
         target column; they are produced from the model outputs and inverse-
         scaled with the training-time scaler regardless.
     save_dir : str, optional
-        Root directory for inference outputs. Default ``'inference_results'``.
+        Root directory for inference outputs; must not be a training run's
+        directory. Default ``'inference_results'``.
     graph_format : str, optional
         Molecular graph format: ``'mol2'``, ``'smiles'``, ``'mol'``, or
         ``'sdf'``. Default ``'mol2'``.
@@ -170,6 +171,16 @@ def inference_pipeline(
         DataFrame of predictions and uncertainty metrics saved to
         ``<save_dir>/stats/test_predictions.csv``.
     """
+    # inference overwrites and deletes files under <save_dir>/data, so it must not
+    # run inside a training run's directory
+    if os.path.exists(os.path.join(save_dir, "config.yaml")) or os.path.isdir(
+        os.path.join(save_dir, "checkpoints")
+    ):
+        raise ValueError(
+            f"save_dir '{save_dir}' contains a training run (config.yaml or checkpoints/). "
+            f"Inference writes and deletes files under {os.path.join(save_dir, 'data')}, "
+            f"which would damage that run; choose a different save_dir."
+        )
     data_path = os.path.join(save_dir, "data")
     stats_path = os.path.join(save_dir, "stats")
     os.makedirs(data_path, exist_ok=True)
@@ -244,6 +255,8 @@ def inference_pipeline(
         data_path=data_path,
         implicit_Hs=implicit_Hs,
         rdkit_features=train_args.get("rdkit_features", False),
+        # always rebuild: a cache left in save_dir by an earlier run may hold other molecules
+        use_cache=False,
     )
 
     # Reassign for safety: ``preprocess`` will have written the supplied scaler

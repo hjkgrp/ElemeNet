@@ -884,6 +884,7 @@ class DataModule:
         node_feature_offsets_path=None,
         node_feature_labels_path=None,
         node_feature_mode="concat",
+        use_cache=True,
     ):
         """Build graph datasets and cache them to disk, or load from cache if available.
 
@@ -925,6 +926,9 @@ class DataModule:
             Directory for cached ``.pt`` files. Default current directory.
         implicit_Hs : bool, optional
             Include implicit hydrogen atoms. Default False.
+        use_cache : bool, optional
+            Load the ``.pt`` cache if it exists. ``False`` always rebuilds the
+            graphs and overwrites the cache. Default True.
         """
         if isinstance(target_column, str):
             target_column = [target_column]
@@ -946,7 +950,7 @@ class DataModule:
                 "SMILES do not encode 3D coordinates and are not supported for EGNN models."
             )
         data = None
-        if os.path.exists(save_path):
+        if use_cache and os.path.exists(save_path):
             print(f"Found processed graphs at {save_path}. Loading...")
             data = torch.load(save_path, weights_only=False)
             if scope == "edge" and data.get("graph_version", 1) < GRAPH_VERSION:
