@@ -1886,6 +1886,10 @@ def mol_to_graph(
     x = torch.tensor(node_attr, dtype=torch.float)
 
     # featurize each bond (edge)
+    # edges follow the input bond order (edge k = bond k), stored as (lower, higher)
+    # atom pairs, so edge-level targets and per-bond features line up with edge_index
+    edge_pairs = []
+    edge_features_by_pair = {}
     for bond_idx, bond in enumerate(bonds):
         atom1, atom2, bond_type = bond
         # extract features for this specific bond from the dict of lists
@@ -1903,15 +1907,18 @@ def mol_to_graph(
             extra_feature_dict=extra_feature_dict,
         )
         mol.add_edge(atom1, atom2, **edge_features)
+        pair = (min(atom1, atom2), max(atom1, atom2))
+        if pair not in edge_features_by_pair:
+            edge_pairs.append(pair)
+        edge_features_by_pair[pair] = edge_features
 
     # Handle edge_index creation, accounting for molecules with no edges (disconnected atoms)
     # This is valid for sparse/disconnected molecular graphs
-    edges = list(mol.edges)
-    if len(edges) > 0:
-        edge_index = torch.tensor(edges).t().contiguous()
+    if len(edge_pairs) > 0:
+        edge_index = torch.tensor(edge_pairs).t().contiguous()
         edge_attr = [
-            [edge[feature] for feature in edge_features.keys()]
-            for _, _, edge in mol.edges(data=True)
+            [edge_features_by_pair[pair][feature] for feature in edge_features.keys()]
+            for pair in edge_pairs
         ]
         edge_attr = torch.tensor(edge_attr, dtype=torch.float)
     else:
@@ -1999,7 +2006,7 @@ def mol_to_graph(
         bo_matrix = elec_bond["bond_orders"]
         # only extract elements of BO matrix corresponding to chemical bonds in molecular graph
         bo_list = []
-        for a, b in mol.edges():
+        for a, b in edge_pairs:
             bo_list.append([bo_matrix[a, b]])
         elec_bond_tensor = torch.tensor(bo_list, dtype=torch.float)
         edge_attr = torch.cat([edge_attr, elec_bond_tensor], dim=1)
@@ -2035,7 +2042,7 @@ def mol_to_graph(
         node_mask = node_mask.unsqueeze(1)
 
         # edge mask: all edges where both endpoints are in the k-hop subgraph
-        edges = torch.tensor(list(mol.edges()), dtype=torch.long)
+        edges = edge_index.t()
         edge_mask = torch.isin(edges[:, 0], subgraph_idx) & torch.isin(
             edges[:, 1], subgraph_idx
         )

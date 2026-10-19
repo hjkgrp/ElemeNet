@@ -94,6 +94,10 @@ def training_pipeline(
     ----------
     target_column : str or list of str
         Column name(s) of the target property in the data CSV.
+        For ``scope='edge'``, each entry is a list with one value per bond, in the
+        order the bonds appear in the input structure (for xyz and cif, whose bonds
+        are inferred from distances, sorted by atom-index pair). With
+        ``center_column``, list only the bonds to the center atom, in that order.
     task : str
         Learning task: ``'regression'`` or ``'classification'``.
     model_config : dict

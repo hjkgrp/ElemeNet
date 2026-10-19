@@ -20,6 +20,12 @@ from torch_geometric.loader import DataLoader as GraphDataLoader
 from tqdm import tqdm
 import numpy as np
 
+# version of the graph construction saved with processed-graph caches.
+# 2: edges follow input bond order (1 used networkx's order). Edge-scope caches
+# older than 2 are rebuilt on load; graph- and node-scope models do not depend
+# on edge order, so their caches are kept.
+GRAPH_VERSION = 2
+
 
 def attach_node_features(graphs, values_path, offsets_path, labels_path, mode, split):
     """Seed each graph's node features with precomputed per-atom vectors.
@@ -592,6 +598,25 @@ class DataModule:
                             f"(pre-filtered)."
                         )
 
+                # edge-level targets need one value per predicted edge, in input bond order
+                if scope == "edge":
+                    edge_sel = getattr(X_graph[i], "center_edge_mask", None)
+                    if edge_sel is None:
+                        edge_sel = getattr(X_graph[i], "edge_mask", None)
+                    n_pred_edges = (
+                        int(edge_sel.sum())
+                        if edge_sel is not None
+                        else X_graph[i].edge_index.shape[1]
+                    )
+                    if y_tensor.shape[0] != n_pred_edges:
+                        raise ValueError(
+                            f"Graph {i} in {split} split: {y_tensor.shape[0]} edge-level "
+                            f"targets, but the model predicts {n_pred_edges} edges for this "
+                            f"graph. Edge targets must list one value per bond, in the same "
+                            f"order as the bonds in the input structure (only the bonds "
+                            f"to the center atom, if center_column is given)."
+                        )
+
                 X_graph[i].y = y_tensor
 
                 # labels are defined per graph, but targets are per graph/node/edge
@@ -917,9 +942,20 @@ class DataModule:
             raise ValueError(
                 "SMILES do not encode 3D coordinates and are not supported for EGNN models."
             )
+        data = None
         if os.path.exists(save_path):
             print(f"Found processed graphs at {save_path}. Loading...")
             data = torch.load(save_path, weights_only=False)
+            if scope == "edge" and data.get("graph_version", 1) < GRAPH_VERSION:
+                if not os.path.exists(os.path.join(data_path, "X_data", "X_train.pkl")):
+                    raise ValueError(
+                        f"{save_path} was built before edges were stored in input bond "
+                        f"order, so its edge-level targets may not line up with their "
+                        f"bonds, and it cannot be rebuilt because the preprocessed "
+                        f"molecules in {os.path.join(data_path, 'X_data')} are missing."
+                    )
+                data = None
+        if data is not None:
             self.graphs_splits = data["graphs_splits"]
             self.target_column = data["target_column"]
             self.label_column = data["label_column"]
@@ -992,6 +1028,7 @@ class DataModule:
                     "label_column": self.label_column,
                     "num_classes": self.num_classes,
                     "classes": self.classes,
+                    "graph_version": GRAPH_VERSION,
                 },
                 save_path,
             )
