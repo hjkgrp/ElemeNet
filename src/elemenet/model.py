@@ -89,6 +89,19 @@ def build_encoder_config(encoder_type: str, params: dict):
     convolutions = make_list(encoder_config.get("convolution", "graphconv"), gnn_layers)
     dropouts = make_list(encoder_config.get("dropout", 0.1), gnn_layers)
 
+    # optionally append the graph-level attributes (e.g. charge, spin) to every node's
+    # input features, so message passing sees them rather than only the readout.
+    # Off by default; the width is the data-inferred one the readout already uses.
+    graph_attr_dim = 0
+    if encoder_config.get("graph_attr_to_nodes", False):
+        graph_attr_dim = (params.get("readout_config") or {}).get("graph_attr_dim", 0)
+        if graph_attr_dim == 0:
+            raise ValueError(
+                "encoder_config['graph_attr_to_nodes']=True appends graph-level "
+                "attributes to the node features, but the data has none. Provide them "
+                "with feature_columns={'graph': [...]} (e.g. ['charge', 'spinmult'])."
+            )
+
     if encoder_type == "gnn":
         return GNNConfig(
             input_size=input_size,
@@ -99,6 +112,8 @@ def build_encoder_config(encoder_type: str, params: dict):
             edge_dim=edge_dim,
             gat_heads=encoder_config.get("gat_heads"),
             gat_concat=encoder_config.get("gat_concat"),
+            graph_attr_dim=graph_attr_dim,
+            bidirectional_edges=encoder_config.get("bidirectional_edges", True),
         )
 
     elif encoder_type == "egnn":
@@ -125,6 +140,9 @@ def build_encoder_config(encoder_type: str, params: dict):
             tanh=encoder_config.get("tanh", False),
             coords_range=encoder_config.get("coords_range", 15),
             use_norm=encoder_config.get("use_norm", False),
+            graph_attr_dim=graph_attr_dim,
+            max_num_neighbors=encoder_config.get("max_num_neighbors", 32),
+            nearest_neighbors=encoder_config.get("nearest_neighbors", False),
         )
 
 
@@ -198,7 +216,6 @@ def build_readout_config(readout_type: str, params: dict):
             activations=activations,
             dropouts=dropouts,
             ensemble_size=ensemble_size,
-            max_nodes=readout_config.get("max_nodes"),
             num_heads=readout_config.get("num_heads", 8),
             expansion=readout_config.get("expansion", 4),
             graph_attr_dim=graph_attr_dim,
@@ -248,6 +265,7 @@ def invert_encoder_config(config_obj, encoder_type: str):
     encoder_config = {
         "input_size": cfg["input_size"],
         "edge_dim": cfg["edge_dim"],
+        "graph_attr_to_nodes": cfg.get("graph_attr_dim", 0) > 0,
         **inferred,
     }
 
@@ -263,6 +281,7 @@ def invert_encoder_config(config_obj, encoder_type: str):
             encoder_config["convolution"] = _collapse_if_constant(cfg["convolutions"])
         encoder_config["gat_heads"] = cfg.get("gat_heads")
         encoder_config["gat_concat"] = cfg.get("gat_concat")
+        encoder_config["bidirectional_edges"] = cfg.get("bidirectional_edges", True)
 
     elif encoder_type == "egnn":
         encoder_config["attention"] = cfg.get("attention", False)
@@ -275,6 +294,8 @@ def invert_encoder_config(config_obj, encoder_type: str):
         encoder_config["tanh"] = cfg.get("tanh", False)
         encoder_config["coords_range"] = cfg.get("coords_range", 15)
         encoder_config["use_norm"] = cfg.get("use_norm", False)
+        encoder_config["max_num_neighbors"] = cfg.get("max_num_neighbors", 32)
+        encoder_config["nearest_neighbors"] = cfg.get("nearest_neighbors", False)
 
     return {
         "encoder_type": encoder_type,
@@ -349,7 +370,6 @@ def invert_readout_config(config_obj, readout_type: str):
         }
 
     elif readout_type == "transformer":
-        readout_config["max_nodes"] = cfg.get("max_nodes")
         readout_config["num_heads"] = cfg.get("num_heads", 8)
         readout_config["expansion"] = cfg.get("expansion", 4)
         readout_config["graph_attr_hidden_dim"] = cfg.get("graph_attr_hidden_dim", None)

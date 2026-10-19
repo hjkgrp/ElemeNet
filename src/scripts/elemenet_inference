@@ -10,7 +10,7 @@ if __name__ == "__main__":
     p.add_argument("--mol_column", required=True, help="Name of the molecule column in new data")
     p.add_argument("--target_column", required=False, default=None, type=str, help="Optional. Ground-truth column(s) in new data, comma-separated: 'x,y,z'. Only used to compute metrics and write *_true columns; omit for prediction-only inference on unlabelled data.")
     p.add_argument("--graph_format", default="mol2", help="Graph format for new data (default: mol2)")
-    p.add_argument("--edge_invariant", action="store_true", help="Whether to use edge invariant representation")
+    p.add_argument("--edge_invariant", action="store_true", default=None, help="Use edge-invariant features (default: the training run's setting)")
     p.add_argument("--batch_size", type=int, default=128, help="Batch size for inference (default: 128)")
     p.add_argument("--save_dir", default="inference_results", help="Directory to save inference results")
     p.add_argument("--device", default="cuda", help="Device for inference (default: cuda)")

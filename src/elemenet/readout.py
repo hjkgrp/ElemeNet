@@ -111,8 +111,6 @@ class TransformerConfig:
         Dropout rate for each Transformer layer.
     output_size : int
         Number of output neurons (number of targets).
-    max_nodes : int
-        Maximum number of nodes per graph; used for dense padding.
     num_heads : int
         Number of attention heads in each layer.
     expansion : float
@@ -141,7 +139,6 @@ class TransformerConfig:
     activations: List[str]
     dropouts: List[float]
     output_size: int
-    max_nodes: int
     num_heads: int
     expansion: float = 4
     ensemble_size: int = 1
@@ -432,11 +429,11 @@ class EdgePredictor(nn.Module):
 class Transformer(torch.nn.Module):
     """Transformer-based readout head for graph-level prediction.
 
-    Pads node sequences to ``max_nodes`` via ``to_dense_batch``, applies
-    ``num_layers`` pre-norm attention blocks (each with ``AttentionWithNodeMask``
-    and a SwiGLU feed-forward sub-layer), then unpads and optionally pools
-    before the output projection. Supports the same shallow-ensemble and
-    graph-level attribute injection as ``MLP``.
+    Pads each batch's node sequences to its largest graph via
+    ``to_dense_batch``, applies ``num_layers`` pre-norm attention blocks (each
+    with ``AttentionWithNodeMask`` and a SwiGLU feed-forward sub-layer), then
+    unpads and optionally pools before the output projection. Supports the same
+    shallow-ensemble and graph-level attribute injection as ``MLP``.
 
     All hidden layer sizes must be identical (required by the residual
     connections between attention and feed-forward blocks).
@@ -455,8 +452,9 @@ class Transformer(torch.nn.Module):
         Dropout rate for each attention layer's output projection.
     num_heads : int
         Number of attention heads per layer.
-    max_nodes : int
-        Maximum graph size used to create dense padded batches.
+    max_nodes : int, optional
+        Deprecated and ignored: batches are padded to their largest graph, so
+        no atoms are dropped. Accepted so existing calls keep working.
     ensemble_size : int, optional
         Number of shallow ensemble output heads. Default 1.
     expansion : float, optional
@@ -485,7 +483,7 @@ class Transformer(torch.nn.Module):
         activations,
         dropouts,
         num_heads,
-        max_nodes,
+        max_nodes=None,
         ensemble_size=1,
         expansion=4,
         graph_attr_dim=0,
@@ -501,7 +499,6 @@ class Transformer(torch.nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.ensemble_size = ensemble_size
-        self.max_nodes = max_nodes
         self.graph_attr_dim = graph_attr_dim
         self.graph_attr_hidden_dim = graph_attr_hidden_dim
         self.scope = scope
@@ -583,7 +580,7 @@ class Transformer(torch.nn.Module):
     ):
         assert batch is not None, "Transformer needs patching, which needs batch info."
         # patch to make transformer work
-        x, node_mask = to_dense_batch(x, batch, max_num_nodes=self.max_nodes)
+        x, node_mask = to_dense_batch(x, batch)
 
         # pass through transformer
         x = self.proj_norm(x)

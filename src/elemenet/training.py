@@ -94,6 +94,10 @@ def training_pipeline(
     ----------
     target_column : str or list of str
         Column name(s) of the target property in the data CSV.
+        For ``scope='edge'``, each entry is a list with one value per bond, in the
+        order the bonds appear in the input structure (for xyz and cif, whose bonds
+        are inferred from distances, sorted by atom-index pair). With
+        ``center_column``, list only the bonds to the center atom, in that order.
     task : str
         Learning task: ``'regression'`` or ``'classification'``.
     model_config : dict
@@ -219,6 +223,7 @@ def training_pipeline(
     )
     node_feature_kwargs = {"node_feature_mode": "concat"}
     if preprocessing_kwargs is not None:
+        preprocessing_kwargs = dict(preprocessing_kwargs)
         node_feature_kwargs.update(
             {k: preprocessing_kwargs.pop(k) for k in _NODE_FEATURE_KEYS
              if k in preprocessing_kwargs}
@@ -255,6 +260,10 @@ def training_pipeline(
         seed_scheduler_state = ckpt.get("scheduler")
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        # GNN checkpoints from before bidirectional_edges existed were trained one-way;
+        # resume them that way so training continues the same model
+        if model_config.get("encoder_type") == "gnn":
+            model_config["encoder_config"].setdefault("bidirectional_edges", False)
 
         # Warn if resuming a stateful epoch-derived scheduler with a different
         # epochs value than the original run — the LR trajectory will be wrong
@@ -289,6 +298,18 @@ def training_pipeline(
         print(
             f"Load model at '{seed_model_state_path}' with model config:\n {model_config}"
         )
+        if (
+            model_config.get("encoder_type") == "gnn"
+            and "bidirectional_edges" not in model_config["encoder_config"]
+        ):
+            warnings.warn(
+                "Transfer-learning from a GNN checkpoint saved before bidirectional_edges "
+                "existed. Its weights were trained with messages passing only from lower- "
+                "to higher-numbered atoms; this run passes messages in both directions "
+                "(bidirectional_edges=True), so the pretrained weights will need to "
+                "readjust.",
+                RuntimeWarning,
+            )
 
     if _is_main and save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)

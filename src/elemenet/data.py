@@ -20,6 +20,12 @@ from torch_geometric.loader import DataLoader as GraphDataLoader
 from tqdm import tqdm
 import numpy as np
 
+# version of the graph construction saved with processed-graph caches.
+# 2: edges follow input bond order (1 used networkx's order). Edge-scope caches
+# older than 2 are rebuilt on load; graph- and node-scope models do not depend
+# on edge order, so their caches are kept.
+GRAPH_VERSION = 2
+
 
 def attach_node_features(graphs, values_path, offsets_path, labels_path, mode, split):
     """Seed each graph's node features with precomputed per-atom vectors.
@@ -592,6 +598,25 @@ class DataModule:
                             f"(pre-filtered)."
                         )
 
+                # edge-level targets need one value per predicted edge, in input bond order
+                if scope == "edge":
+                    edge_sel = getattr(X_graph[i], "center_edge_mask", None)
+                    if edge_sel is None:
+                        edge_sel = getattr(X_graph[i], "edge_mask", None)
+                    n_pred_edges = (
+                        int(edge_sel.sum())
+                        if edge_sel is not None
+                        else X_graph[i].edge_index.shape[1]
+                    )
+                    if y_tensor.shape[0] != n_pred_edges:
+                        raise ValueError(
+                            f"Graph {i} in {split} split: {y_tensor.shape[0]} edge-level "
+                            f"targets, but the model predicts {n_pred_edges} edges for this "
+                            f"graph. Edge targets must list one value per bond, in the same "
+                            f"order as the bonds in the input structure (only the bonds "
+                            f"to the center atom, if center_column is given)."
+                        )
+
                 X_graph[i].y = y_tensor
 
                 # labels are defined per graph, but targets are per graph/node/edge
@@ -799,8 +824,8 @@ class DataModule:
                         else None
                     )
 
-                    data_.append(
-                        mol_to_graph(
+                    try:
+                        graph = mol_to_graph(
                             mol,
                             graph_format,
                             edge_invariant,
@@ -816,7 +841,10 @@ class DataModule:
                             implicit_Hs=implicit_Hs,
                             rdkit_features=rdkit_features,
                         )
-                    )
+                    except ValueError as e:
+                        where = f"data row {i + 1}" + ("" if single_source else f" of the {split} split")
+                        raise ValueError(f"Could not build the graph for {where}: {e}") from e
+                    data_.append(graph)
             X_splits.append(data_)
             if feature_columns and encoder_type in ("gnn", "egnn"):
                 if not extra_features["node"].empty:
@@ -856,6 +884,7 @@ class DataModule:
         node_feature_offsets_path=None,
         node_feature_labels_path=None,
         node_feature_mode="concat",
+        use_cache=True,
     ):
         """Build graph datasets and cache them to disk, or load from cache if available.
 
@@ -897,6 +926,9 @@ class DataModule:
             Directory for cached ``.pt`` files. Default current directory.
         implicit_Hs : bool, optional
             Include implicit hydrogen atoms. Default False.
+        use_cache : bool, optional
+            Load the ``.pt`` cache if it exists. ``False`` always rebuilds the
+            graphs and overwrites the cache. Default True.
         """
         if isinstance(target_column, str):
             target_column = [target_column]
@@ -917,15 +949,24 @@ class DataModule:
             raise ValueError(
                 "SMILES do not encode 3D coordinates and are not supported for EGNN models."
             )
-        if os.path.exists(save_path):
+        data = None
+        if use_cache and os.path.exists(save_path):
             print(f"Found processed graphs at {save_path}. Loading...")
             data = torch.load(save_path, weights_only=False)
+            if scope == "edge" and data.get("graph_version", 1) < GRAPH_VERSION:
+                if not os.path.exists(os.path.join(data_path, "X_data", "X_train.pkl")):
+                    raise ValueError(
+                        f"{save_path} was built before edges were stored in input bond "
+                        f"order, so its edge-level targets may not line up with their "
+                        f"bonds, and it cannot be rebuilt because the preprocessed "
+                        f"molecules in {os.path.join(data_path, 'X_data')} are missing."
+                    )
+                data = None
+        if data is not None:
             self.graphs_splits = data["graphs_splits"]
             self.target_column = data["target_column"]
             self.label_column = data["label_column"]
             self.num_classes = data["num_classes"]
-            self.max_nodes = data["max_nodes"]
-            self.max_edges = data["max_edges"]
             self.classes = data.get("classes", None)
             self.class_to_idx = (
                 {int(c): i for i, c in enumerate(self.classes)}
@@ -986,8 +1027,6 @@ class DataModule:
 
             self.target_column = target_column
             self.label_column = label_column
-            self.max_nodes = self.get_max_num_nodes()
-            self.max_edges = self.get_max_num_edges()
 
             torch.save(
                 {
@@ -995,9 +1034,8 @@ class DataModule:
                     "target_column": self.target_column,
                     "label_column": self.label_column,
                     "num_classes": self.num_classes,
-                    "max_nodes": self.max_nodes,
-                    "max_edges": self.max_edges,
                     "classes": self.classes,
+                    "graph_version": GRAPH_VERSION,
                 },
                 save_path,
             )
@@ -1039,27 +1077,6 @@ class DataModule:
     def test_labels(self):
         return [l for g in self.graphs_splits[2] for l in g.label]
 
-    def get_max_num_nodes(self):
-        """Return the maximum number of nodes across all graphs in all splits."""
-        max_num_nodes = 0
-        for split in self.graphs_splits:
-            for graph in split:
-                num_nodes = graph.x.shape[0]
-                if num_nodes > max_num_nodes:
-                    max_num_nodes = num_nodes
-        return max_num_nodes
-
-    def get_max_num_edges(self):
-        """Return the maximum number of edges across all graphs in all splits."""
-        max_num_edges = 0
-        for split in self.graphs_splits:
-            for graph in split:
-                edge_index = getattr(graph, "edge_index", None)
-                num_edges = 0 if edge_index is None else edge_index.shape[1]
-                if num_edges > max_num_edges:
-                    max_num_edges = num_edges
-        return max_num_edges
-
     def infer_model_input_output_size(self):
         """Infer encoder/readout input and output sizes from the processed training data.
 
@@ -1074,8 +1091,7 @@ class DataModule:
         dict
             Nested dict with keys ``'readout_config'`` (sub-keys:
             ``input_size``, ``output_size``, ``graph_attr_dim``, ``edge_dim``)
-            and ``'encoder_config'`` (sub-keys: ``input_size``, ``edge_dim``,
-            ``max_nodes``, ``max_edges``).
+            and ``'encoder_config'`` (sub-keys: ``input_size``, ``edge_dim``).
         """
         # in case that gnn is used as encoder, mlp_input_size will be overwritten later.
         X_train = self.graphs_splits[0][0]
@@ -1103,8 +1119,6 @@ class DataModule:
             "encoder_config": {
                 "input_size": gnn_input_size,
                 "edge_dim": edge_dim,
-                "max_nodes": self.max_nodes,
-                "max_edges": self.max_edges,
             },
         }
 

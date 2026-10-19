@@ -58,13 +58,16 @@ def _patch_legacy_encoder_attrs(encoder):
     reproduces how those models were actually trained: no normalization was
     applied because the code path did not exist.
 
+    ``graph_attr_dim`` (graph attributes appended to the node features) is read
+    the same way by both encoders; 0 means none were appended.
+
     Note this is only needed for the pickled-instance path used here. Resuming
     or seeding training (``training.py``) rebuilds the encoder from
     ``model_config`` with the current class, so it already has these fields.
     """
     if encoder is None:
         return
-    for attr, default in (("use_norm", False), ("h_norms", None)):
+    for attr, default in (("use_norm", False), ("h_norms", None), ("graph_attr_dim", 0)):
         if not hasattr(encoder, attr):
             setattr(encoder, attr, default)
 
@@ -111,14 +114,17 @@ def inference_pipeline(
     target_column=None,
     save_dir="inference_results",
     graph_format="mol2",
-    edge_invariant=False,
+    edge_invariant=None,
     batch_size=128,
     device="cuda",
 ):
     """Run inference with a trained ElemeNet model on new (unlabelled) data.
 
     Loads a saved model checkpoint, preprocesses the new dataset using the
-    same settings as training (including feature columns and graph format),
+    same settings as training (feature columns, implicit hydrogens, RDKit
+    features, center column and k_hops, bond scale factor, charge/spin
+    override, xTB and bulk features, edge-invariant features, and the label
+    column when the new data has it),
     overwrites the target scaler with the one fitted on training data to
     prevent data leakage, and saves predictions and uncertainty metrics to
     ``<save_dir>/stats/``.
@@ -146,13 +152,14 @@ def inference_pipeline(
         target column; they are produced from the model outputs and inverse-
         scaled with the training-time scaler regardless.
     save_dir : str, optional
-        Root directory for inference outputs. Default ``'inference_results'``.
+        Root directory for inference outputs; must not be a training run's
+        directory. Default ``'inference_results'``.
     graph_format : str, optional
         Molecular graph format: ``'mol2'``, ``'smiles'``, ``'mol'``, or
         ``'sdf'``. Default ``'mol2'``.
-    edge_invariant : bool, optional
+    edge_invariant : bool or None, optional
         Build graphs with distance-based (invariant) edge features only.
-        Default False.
+        Default None uses the training run's setting.
     batch_size : int, optional
         Number of molecules per inference batch. Default 128.
     device : str or torch.device, optional
@@ -164,6 +171,16 @@ def inference_pipeline(
         DataFrame of predictions and uncertainty metrics saved to
         ``<save_dir>/stats/test_predictions.csv``.
     """
+    # inference overwrites and deletes files under <save_dir>/data, so it must not
+    # run inside a training run's directory
+    if os.path.exists(os.path.join(save_dir, "config.yaml")) or os.path.isdir(
+        os.path.join(save_dir, "checkpoints")
+    ):
+        raise ValueError(
+            f"save_dir '{save_dir}' contains a training run (config.yaml or checkpoints/). "
+            f"Inference writes and deletes files under {os.path.join(save_dir, 'data')}, "
+            f"which would damage that run; choose a different save_dir."
+        )
     data_path = os.path.join(save_dir, "data")
     stats_path = os.path.join(save_dir, "stats")
     os.makedirs(data_path, exist_ok=True)
@@ -186,8 +203,15 @@ def inference_pipeline(
     # process new data
     dataset = DataModule(task=train_args["task"])
 
-    # use same feature columns as training to ensure consistent graph representations
+    # build graphs exactly as the training run did, using its config.yaml settings
     implicit_Hs = train_args.get("implicit_Hs", False)
+    if edge_invariant is None:
+        edge_invariant = train_args.get("edge_invariant", False)
+    center_column = train_args.get("center_column")
+    bond_scale_factor = train_args.get("bond_scale_factor", 1.0)
+    label_column = train_args.get("label_column")
+    if label_column is not None and label_column not in pd.read_csv(new_data_path, nrows=0).columns:
+        label_column = None
     # Pass the training-time ``y_scaler`` into ``preprocess`` so target scaling
     # at inference uses the same scaler the model was trained against. Without
     # this, ``preprocess`` would silently re-fit a fresh scaler on the inference
@@ -203,9 +227,12 @@ def inference_pipeline(
         mol_column=mol_column,
         target_column=target_column,
         task=train_args["task"],
+        label_column=label_column,
+        center_columns=center_column,
         feature_columns=train_args["feature_columns"],
         graph_format=graph_format,
         train_val_test_split=None,
+        bond_scale_factor=bond_scale_factor,
         data_path=data_path,
         y_scaler=train_scaler if has_targets else None,
     )
@@ -216,11 +243,20 @@ def inference_pipeline(
         target_column=target_column,
         mol_column=mol_column,
         scope=train_args["model_config"]["scope"],
+        label_column=label_column,
         graph_format=graph_format,
         edge_invariant=edge_invariant,
+        center_column=center_column,
+        k_hops=train_args.get("k_hops", 1),
+        use_xtb=train_args.get("use_xtb", False),
+        use_bulk=train_args.get("use_bulk", False),
+        bond_scale_factor=bond_scale_factor,
+        charge_spin_override=train_args.get("charge_spin_override", False),
         data_path=data_path,
         implicit_Hs=implicit_Hs,
         rdkit_features=train_args.get("rdkit_features", False),
+        # always rebuild: a cache left in save_dir by an earlier run may hold other molecules
+        use_cache=False,
     )
 
     # Reassign for safety: ``preprocess`` will have written the supplied scaler

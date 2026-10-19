@@ -203,41 +203,38 @@ def estimate_size(model):
     return total_bytes / (1024**2)
 
 
-def estimate_training_memory(model_config, batch_size, param_bytes=4):
-    """Estimate peak GPU memory required during training.
+def estimate_training_memory(model_config, batch_size, param_bytes=4, device=None):
+    """Estimate peak memory required during training.
 
-    Accounts for encoder and readout parameter storage, optimizer state,
-    activation memory, and EGNN message/coordinate buffers, plus a 2 GB
-    fixed buffer. Also queries the total memory of GPU 0 for comparison.
+    Accounts for encoder and readout parameter storage and optimizer state,
+    plus a 2 GB fixed buffer. Also returns the total memory of the device
+    training runs on, for comparison.
 
     Parameters
     ----------
     model_config : dict
         Model configuration containing ``encoder_config`` and ``readout_config``
-        sub-dicts with keys such as ``layers``, ``neurons``, ``inv_sublayers``,
-        ``max_nodes``.
+        sub-dicts with keys such as ``layers``, ``neurons``, ``inv_sublayers``.
     batch_size : int
         Number of graphs per training batch.
     param_bytes : int, optional
         Bytes per parameter (default 4 for float32).
+    device : str, torch.device or None, optional
+        Device training runs on. Default None: CUDA if available, else CPU.
 
     Returns
     -------
     total_gb : float
         Estimated peak memory requirement in GB.
-    gpu_ram : float
-        Total memory of GPU 0 in GB, or 0 if CUDA is unavailable.
+    device_ram : float
+        Total memory of ``device`` in GB: GPU memory for CUDA, physical RAM for
+        the CPU, or ``inf`` if it cannot be read.
     """
     # encoder parameters
     encoder = model_config.get("encoder_config", {})
     enc_layers = encoder.get("layers", 0)
     enc_neurons = encoder.get("neurons", 0)
     enc_sublayers = encoder.get("inv_sublayers", 0)
-    # graph size
-    max_nodes = encoder.get("max_nodes", 0)
-    nodes_per_batch = max_nodes * batch_size
-    max_edges = max_nodes**2
-    edges_per_batch = max_edges * batch_size
     # estimate as layer weight matrices + biases + inv_sublayers
     param_mem = enc_layers * enc_neurons**2 * param_bytes * (1 + enc_sublayers)
 
@@ -251,38 +248,26 @@ def estimate_training_memory(model_config, batch_size, param_bytes=4):
     # optimizer memory
     optimizer_mem = 2 * param_mem
 
-    # activation memory
-    encoder_act_mem = (
-        enc_layers
-        * edges_per_batch
-        * enc_neurons
-        * param_bytes
-        * 2
-        * (1 + enc_sublayers)
-    )
-    readout_act_mem = read_layers * nodes_per_batch * read_neurons * param_bytes * 2
-
-    # message/coordinate memory
-    message_mem = (
-        enc_layers * edges_per_batch * enc_neurons * param_bytes * (1 + enc_sublayers)
-    )
-
     # finalize estimate
     buffer_gb = 2.0
-    total_bytes = (
-        param_mem + optimizer_mem + encoder_act_mem + readout_act_mem + message_mem
-    )
+    total_bytes = param_mem + optimizer_mem
     total_gb = total_bytes / (1024**3) + buffer_gb
 
     # estimate available memory
-    if torch.cuda.is_available():
-        gpu_id = 0  # adjust if using multiple GPUs
-        gpu_ram = torch.cuda.get_device_properties(gpu_id).total_memory
-        gpu_ram = gpu_ram / (1024**3)  # convert bytes to GB
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device)
+    if device.type == "cuda":
+        device_ram = torch.cuda.get_device_properties(device).total_memory
+        device_ram = device_ram / (1024**3)  # convert bytes to GB
     else:
-        gpu_ram = 0
+        try:
+            device_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            device_ram = device_ram / (1024**3)  # convert bytes to GB
+        except (AttributeError, ValueError, OSError):
+            device_ram = float("inf")
 
-    return total_gb, gpu_ram
+    return total_gb, device_ram
 
 
 def save_predictions(
