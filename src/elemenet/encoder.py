@@ -108,6 +108,14 @@ class EGNNConfig:
     graph_attr_dim : int
         Number of graph-level attributes (e.g. charge, spin) appended to every
         node's input features. Default 0 (none).
+    max_num_neighbors : Optional[int]
+        Most neighbours each atom keeps from the cutoff graph. Default 32.
+        ``None`` keeps every atom inside the cutoff.
+    nearest_neighbors : bool
+        When the cap binds, keep each atom's ``max_num_neighbors`` nearest
+        atoms (ties go to the lower atom index), identically on CPU and GPU.
+        Default False keeps PyG's choice: the lowest-numbered atoms inside the
+        cutoff on GPU, KD-tree search order on CPU.
     """
 
     input_size: int
@@ -127,6 +135,8 @@ class EGNNConfig:
     num_gaussians: int = 64
     use_norm: bool = False
     graph_attr_dim: int = 0
+    max_num_neighbors: Optional[int] = 32
+    nearest_neighbors: bool = False
 
 
 def append_graph_attr(x, data):
@@ -136,6 +146,38 @@ def append_graph_attr(x, data):
     readout receives.
     """
     return torch.cat([x, data.graph_attr[data.batch]], dim=-1)
+
+
+def cutoff_graph(x, r, batch, max_num_neighbors=32, nearest_neighbors=False):
+    """Radius graph for the EGNN: ``edge_index[1]`` holds each centre atom and
+    ``edge_index[0]`` the neighbours it keeps, at most ``max_num_neighbors``.
+
+    ``nearest_neighbors=False`` is PyG's ``radius_graph``. ``True`` keeps each
+    centre's nearest atoms inside the cutoff (ties go to the lower atom index),
+    with distances in float64 so CPU and GPU keep exactly the same edges.
+    """
+    n = x.size(0)
+    largest = int(torch.bincount(batch).max()) if batch is not None and n > 0 else n
+    if not nearest_neighbors:
+        cap = largest if max_num_neighbors is None else max_num_neighbors
+        return radius_graph(x, r=r, batch=batch, max_num_neighbors=cap)
+    # every pair inside a slightly larger radius, then the exact cutoff in float64
+    edge_index = radius_graph(x, r=r * (1 + 1e-5), batch=batch, max_num_neighbors=largest)
+    diff = x[edge_index[0]].double() - x[edge_index[1]].double()
+    dist2 = diff[:, 0] * diff[:, 0] + diff[:, 1] * diff[:, 1] + diff[:, 2] * diff[:, 2]
+    inside = dist2 < float(r) ** 2
+    edge_index, dist2 = edge_index[:, inside], dist2[inside]
+    # order by centre, then distance, then neighbour index
+    order = torch.argsort(edge_index[0], stable=True)
+    order = order[torch.argsort(dist2[order], stable=True)]
+    order = order[torch.argsort(edge_index[1][order], stable=True)]
+    edge_index = edge_index[:, order]
+    if max_num_neighbors is not None:
+        centre = edge_index[1]
+        counts = torch.bincount(centre, minlength=n)
+        rank = torch.arange(centre.numel(), device=x.device) - (torch.cumsum(counts, 0) - counts)[centre]
+        edge_index = edge_index[:, rank < max_num_neighbors]
+    return edge_index
 
 
 class GNN_Encoder(nn.Module):
@@ -357,8 +399,14 @@ class EGNN_Encoder(nn.Module):
         graph_attr_dim: int
             Number of graph-level attributes appended to every node's input features.
             default=0
+        max_num_neighbors: int or None
+            Most neighbours each atom keeps from the cutoff graph; None keeps all.
+            default=32
+        nearest_neighbors: bool
+            Keep each atom's nearest neighbours when the cap binds, identically on CPU and GPU.
+            default=False
     """
-    
+
     def __init__(
         self,
         input_size,
@@ -379,6 +427,8 @@ class EGNN_Encoder(nn.Module):
         use_norm=False,
         dropouts=None,
         graph_attr_dim=0,
+        max_num_neighbors=32,
+        nearest_neighbors=False,
         **kwargs,
     ):
         super().__init__()
@@ -388,6 +438,8 @@ class EGNN_Encoder(nn.Module):
         out_node_nf = hidden_sizes[-1]
         self.output_size = out_node_nf
         self.cutoff = cutoff
+        self.max_num_neighbors = max_num_neighbors
+        self.nearest_neighbors = nearest_neighbors
         if dropouts is None:
             dropouts = [0.0] * len(hidden_sizes)
         if self.cutoff is not None:
@@ -463,8 +515,13 @@ class EGNN_Encoder(nn.Module):
             h = append_graph_attr(h, data)
 
         if self.cutoff is not None:
-            edge_index = radius_graph(
-                x, r=self.cutoff, batch=data.batch, max_num_neighbors=32
+            # encoders pickled before these options existed used a cap of 32 and PyG's choice
+            edge_index = cutoff_graph(
+                x,
+                self.cutoff,
+                data.batch,
+                max_num_neighbors=getattr(self, "max_num_neighbors", 32),
+                nearest_neighbors=getattr(self, "nearest_neighbors", False),
             )
             edge_attr = None
         else:

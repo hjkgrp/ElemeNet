@@ -141,6 +141,8 @@ def build_encoder_config(encoder_type: str, params: dict):
             coords_range=encoder_config.get("coords_range", 15),
             use_norm=encoder_config.get("use_norm", False),
             graph_attr_dim=graph_attr_dim,
+            max_num_neighbors=encoder_config.get("max_num_neighbors", 32),
+            nearest_neighbors=encoder_config.get("nearest_neighbors", False),
         )
 
 
@@ -292,6 +294,8 @@ def invert_encoder_config(config_obj, encoder_type: str):
         encoder_config["tanh"] = cfg.get("tanh", False)
         encoder_config["coords_range"] = cfg.get("coords_range", 15)
         encoder_config["use_norm"] = cfg.get("use_norm", False)
+        encoder_config["max_num_neighbors"] = cfg.get("max_num_neighbors", 32)
+        encoder_config["nearest_neighbors"] = cfg.get("nearest_neighbors", False)
 
     return {
         "encoder_type": encoder_type,
