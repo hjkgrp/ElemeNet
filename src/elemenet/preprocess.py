@@ -191,18 +191,11 @@ def _is_feature_continuous(values, feature_type):
 
 
 def scale_and_encode_user_features(extra_features_dict):
-    """Automatically detect and scale or encode user-provided feature columns.
+    """Automatically detect and encode user-provided feature columns.
 
-    Numeric columns are treated as continuous and StandardScaler-normalized.
-    Non-numeric columns are treated as categorical and one-hot encoded.
-    Graph-level ``charge`` and ``spinmult`` columns are passed through
-    unscaled because they are normalized later inside ``mol_fingerprint``.
-
-    .. note::
-        Do not pass pre-constructed one-hot encoded columns (binary ``{0, 1}``
-        arrays) as ``feature_columns``; they will be detected as continuous and
-        incorrectly StandardScaler-normalized. Pass the original categorical
-        column instead and let this function encode it.
+    Numeric columns are treated as continuous and used as provided, without
+    scaling; scale them beforehand if needed. Non-numeric columns are treated
+    as categorical and one-hot encoded.
 
     Parameters
     ----------
@@ -213,10 +206,10 @@ def scale_and_encode_user_features(extra_features_dict):
     Returns
     -------
     extra_features_dict : dict
-        Modified in-place with scaled/encoded features.
+        Modified in-place with encoded features.
     scalers_dict : dict
-        Maps ``(feature_type, column_name)`` to a ``('continuous', scaler)``
-        tuple or a ``('categorical', choices)`` tuple.
+        Maps ``(feature_type, column_name)`` to a ``('categorical', choices)``
+        tuple for each one-hot encoded column.
     """
     scalers_dict = {}
 
@@ -232,33 +225,8 @@ def scale_and_encode_user_features(extra_features_dict):
             values = df[col]
 
             if _is_feature_continuous(values, feature_type):
-                # continuous feature: fit and apply StandardScaler
-                # flatten all values across all rows
-                if feature_type in ["node", "edge"]:
-                    # list of lists --> flatten to 1D
-                    flattened = np.array(_flatten_series_of_lists(values), dtype=float)
-                else:
-                    # molecule features are scalars
-                    flattened = np.array(values, dtype=float)
-
-                # fit scaler on flattened data
-                scaler = StandardScaler()
-                scaler.fit(flattened.reshape(-1, 1))
-                scalers_dict[(feature_type, col)] = ("continuous", scaler)
-
-                # apply scaler to each row
-                if feature_type in ["node", "edge"]:
-                    df[col] = df[col].apply(
-                        lambda val_list, s=scaler: s.transform(
-                            np.array(val_list, dtype=float).reshape(-1, 1)
-                        )
-                        .flatten()
-                        .tolist()
-                    )
-                else:
-                    df[col] = scaler.transform(
-                        np.array(values, dtype=float).reshape(-1, 1)
-                    ).flatten()
+                # continuous features are used as provided (no scaling)
+                continue
 
             else:
                 # categorical feature: one-hot encode
@@ -584,7 +552,7 @@ def featurize(
 
     extra_features = get_extra_features(data=all_data, feature_columns=feature_columns)
 
-    # automatically scale/encode user-provided features
+    # one-hot encode categorical user-provided features (numeric ones are used as provided)
     extra_features, _ = scale_and_encode_user_features(extra_features)
 
     columns = [mol_column]

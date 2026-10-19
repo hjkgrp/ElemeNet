@@ -132,7 +132,7 @@ class EGNNConfig:
 def append_graph_attr(x, data):
     """Append each graph's attributes (e.g. charge, spin) to all of its nodes' features.
 
-    Uses ``data.graph_attr`` as-is, so nodes see exactly the scaled values the
+    Uses ``data.graph_attr`` as-is, so nodes see exactly the values the
     readout receives.
     """
     return torch.cat([x, data.graph_attr[data.batch]], dim=-1)
