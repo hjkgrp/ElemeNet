@@ -42,6 +42,8 @@ class GNNConfig:
     graph_attr_dim : int
         Number of graph-level attributes (e.g. charge, spin) appended to every
         node's input features. Default 0 (none).
+    bidirectional_edges : bool
+        Pass messages both ways along every bond. Default True.
     """
 
     input_size: int
@@ -53,6 +55,7 @@ class GNNConfig:
     gat_heads: Optional[int] = None
     gat_concat: Optional[bool] = None
     graph_attr_dim: int = 0
+    bidirectional_edges: bool = True
 
 
 @dataclass
@@ -161,6 +164,9 @@ class GNN_Encoder(nn.Module):
         graph_attr_dim: int
             Number of graph-level attributes appended to every node's input features.
             default=0
+        bidirectional_edges: bool
+            Pass messages both ways along every bond.
+            default=True
     """
 
     def __init__(
@@ -174,6 +180,7 @@ class GNN_Encoder(nn.Module):
         gat_heads=None,
         gat_concat=None,
         graph_attr_dim=0,
+        bidirectional_edges=True,
         **kwargs,
     ):
         super().__init__()
@@ -187,6 +194,7 @@ class GNN_Encoder(nn.Module):
         self.dropouts = nn.ModuleList()
         self.edge_dim = edge_dim
         self.graph_attr_dim = graph_attr_dim
+        self.bidirectional_edges = bidirectional_edges
         in_dim = input_size + graph_attr_dim
         # configure GAT parameters
         if gat_heads is None:
@@ -262,6 +270,12 @@ class GNN_Encoder(nn.Module):
         if self.graph_attr_dim > 0:
             x = append_graph_attr(x, data)
         edge_attr = getattr(data, "edge_attr", None)
+        # data.edge_index holds each bond once (readouts, masks and edge targets rely
+        # on that), so add the reverse direction for message passing only.
+        if getattr(self, "bidirectional_edges", False):
+            edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+            if edge_attr is not None:
+                edge_attr = torch.cat([edge_attr, edge_attr], dim=0)
 
         for idx, conv in enumerate(self.convolutions):
             # store residual

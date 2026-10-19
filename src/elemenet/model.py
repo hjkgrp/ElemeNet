@@ -113,6 +113,7 @@ def build_encoder_config(encoder_type: str, params: dict):
             gat_heads=encoder_config.get("gat_heads"),
             gat_concat=encoder_config.get("gat_concat"),
             graph_attr_dim=graph_attr_dim,
+            bidirectional_edges=encoder_config.get("bidirectional_edges", True),
         )
 
     elif encoder_type == "egnn":
@@ -278,6 +279,7 @@ def invert_encoder_config(config_obj, encoder_type: str):
             encoder_config["convolution"] = _collapse_if_constant(cfg["convolutions"])
         encoder_config["gat_heads"] = cfg.get("gat_heads")
         encoder_config["gat_concat"] = cfg.get("gat_concat")
+        encoder_config["bidirectional_edges"] = cfg.get("bidirectional_edges", True)
 
     elif encoder_type == "egnn":
         encoder_config["attention"] = cfg.get("attention", False)

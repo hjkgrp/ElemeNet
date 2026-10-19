@@ -259,6 +259,10 @@ def training_pipeline(
         seed_scheduler_state = ckpt.get("scheduler")
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        # GNN checkpoints from before bidirectional_edges existed were trained one-way;
+        # resume them that way so training continues the same model
+        if model_config.get("encoder_type") == "gnn":
+            model_config["encoder_config"].setdefault("bidirectional_edges", False)
 
         # Warn if resuming a stateful epoch-derived scheduler with a different
         # epochs value than the original run — the LR trajectory will be wrong
@@ -293,6 +297,18 @@ def training_pipeline(
         print(
             f"Load model at '{seed_model_state_path}' with model config:\n {model_config}"
         )
+        if (
+            model_config.get("encoder_type") == "gnn"
+            and "bidirectional_edges" not in model_config["encoder_config"]
+        ):
+            warnings.warn(
+                "Transfer-learning from a GNN checkpoint saved before bidirectional_edges "
+                "existed. Its weights were trained with messages passing only from lower- "
+                "to higher-numbered atoms; this run passes messages in both directions "
+                "(bidirectional_edges=True), so the pretrained weights will need to "
+                "readjust.",
+                RuntimeWarning,
+            )
 
     if _is_main and save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
