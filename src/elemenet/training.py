@@ -223,6 +223,7 @@ def training_pipeline(
     )
     node_feature_kwargs = {"node_feature_mode": "concat"}
     if preprocessing_kwargs is not None:
+        preprocessing_kwargs = dict(preprocessing_kwargs)
         node_feature_kwargs.update(
             {k: preprocessing_kwargs.pop(k) for k in _NODE_FEATURE_KEYS
              if k in preprocessing_kwargs}
