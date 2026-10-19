@@ -114,14 +114,17 @@ def inference_pipeline(
     target_column=None,
     save_dir="inference_results",
     graph_format="mol2",
-    edge_invariant=False,
+    edge_invariant=None,
     batch_size=128,
     device="cuda",
 ):
     """Run inference with a trained ElemeNet model on new (unlabelled) data.
 
     Loads a saved model checkpoint, preprocesses the new dataset using the
-    same settings as training (including feature columns and graph format),
+    same settings as training (feature columns, implicit hydrogens, RDKit
+    features, center column and k_hops, bond scale factor, charge/spin
+    override, xTB and bulk features, edge-invariant features, and the label
+    column when the new data has it),
     overwrites the target scaler with the one fitted on training data to
     prevent data leakage, and saves predictions and uncertainty metrics to
     ``<save_dir>/stats/``.
@@ -153,9 +156,9 @@ def inference_pipeline(
     graph_format : str, optional
         Molecular graph format: ``'mol2'``, ``'smiles'``, ``'mol'``, or
         ``'sdf'``. Default ``'mol2'``.
-    edge_invariant : bool, optional
+    edge_invariant : bool or None, optional
         Build graphs with distance-based (invariant) edge features only.
-        Default False.
+        Default None uses the training run's setting.
     batch_size : int, optional
         Number of molecules per inference batch. Default 128.
     device : str or torch.device, optional
@@ -189,8 +192,15 @@ def inference_pipeline(
     # process new data
     dataset = DataModule(task=train_args["task"])
 
-    # use same feature columns as training to ensure consistent graph representations
+    # build graphs exactly as the training run did, using its config.yaml settings
     implicit_Hs = train_args.get("implicit_Hs", False)
+    if edge_invariant is None:
+        edge_invariant = train_args.get("edge_invariant", False)
+    center_column = train_args.get("center_column")
+    bond_scale_factor = train_args.get("bond_scale_factor", 1.0)
+    label_column = train_args.get("label_column")
+    if label_column is not None and label_column not in pd.read_csv(new_data_path, nrows=0).columns:
+        label_column = None
     # Pass the training-time ``y_scaler`` into ``preprocess`` so target scaling
     # at inference uses the same scaler the model was trained against. Without
     # this, ``preprocess`` would silently re-fit a fresh scaler on the inference
@@ -206,9 +216,12 @@ def inference_pipeline(
         mol_column=mol_column,
         target_column=target_column,
         task=train_args["task"],
+        label_column=label_column,
+        center_columns=center_column,
         feature_columns=train_args["feature_columns"],
         graph_format=graph_format,
         train_val_test_split=None,
+        bond_scale_factor=bond_scale_factor,
         data_path=data_path,
         y_scaler=train_scaler if has_targets else None,
     )
@@ -219,8 +232,15 @@ def inference_pipeline(
         target_column=target_column,
         mol_column=mol_column,
         scope=train_args["model_config"]["scope"],
+        label_column=label_column,
         graph_format=graph_format,
         edge_invariant=edge_invariant,
+        center_column=center_column,
+        k_hops=train_args.get("k_hops", 1),
+        use_xtb=train_args.get("use_xtb", False),
+        use_bulk=train_args.get("use_bulk", False),
+        bond_scale_factor=bond_scale_factor,
+        charge_spin_override=train_args.get("charge_spin_override", False),
         data_path=data_path,
         implicit_Hs=implicit_Hs,
         rdkit_features=train_args.get("rdkit_features", False),
