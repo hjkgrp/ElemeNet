@@ -89,6 +89,10 @@ class Trainer:
                 model_config["readout_config"], model_config["readout_type"]
             )
         )
+        # record training settings so resuming/transfer-learning from checkpoint correctly rebuilds loss, optimizer, and LR scheduler
+        self.clean_model_config.update(
+            invert_training_config(loss_config, optimizer_config, self.scheduler_config)
+        )
 
         # detect distributed environment (requires dist.init_process_group already called).
         self.distributed = dist.is_available() and dist.is_initialized()
@@ -1144,6 +1148,31 @@ def extract_scheduler_config(params):
         "scheduler_type": params.get("scheduler_type"),
         "scheduler_config": params.get("scheduler_config") or {},
     }
+
+
+TRAINING_PARAM_KEYS = (
+    "loss_type", "pos_weight", "class_weight", "anti_collapse_weight", "anti_collapse_eps",
+    "sigma_min", "optimizer_type", "learning_rate", "weight_decay", "scheduler_type",
+    "scheduler_config",
+)
+
+
+def invert_training_config(loss_config, optimizer_config, scheduler_config):
+    """Convert loss, optimizer and scheduler configs back to flat parameters.
+
+    Reverses ``extract_loss_config``, ``extract_optimizer_config`` and
+    ``extract_scheduler_config``: feeding the result to them rebuilds the same
+    configs. Every key is one of ``TRAINING_PARAM_KEYS``.
+    """
+    params = dict(loss_config)
+    params.update(
+        optimizer_type=optimizer_config["optimizer_type"],
+        learning_rate=optimizer_config["lr"],
+        weight_decay=optimizer_config["weight_decay"],
+        scheduler_type=scheduler_config["scheduler_type"],
+        scheduler_config=dict(scheduler_config["scheduler_config"]),
+    )
+    return params
 
 
 def build_scheduler(scheduler_type, scheduler_config, optimizer, epochs, steps_per_epoch):
