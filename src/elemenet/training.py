@@ -8,6 +8,7 @@ from elemenet.data import DataModule
 from elemenet.hypersearch import optimize, hypersearch_worker_loop
 from elemenet.model import extract_model_config
 from elemenet.trainer import (
+    TRAINING_PARAM_KEYS,
     Trainer,
     extract_loss_config,
     extract_optimizer_config,
@@ -232,7 +233,8 @@ def training_pipeline(
     node_feature_mode = node_feature_kwargs["node_feature_mode"]
 
     # save training hyperparams before model_config may be replaced by a checkpoint's
-    # architecture-only model_config (which does not store loss_type/optimizer_type).
+    # model_config (older checkpoints store only the architecture).
+    _user_model_config = model_config
     _loss_type = model_config.get("loss_type")
     _optimizer_type = model_config.get("optimizer_type", "adamw")
 
@@ -260,6 +262,9 @@ def training_pipeline(
         seed_scheduler_state = ckpt.get("scheduler")
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        for key in TRAINING_PARAM_KEYS:
+            if key not in model_config and key in _user_model_config:
+                model_config[key] = _user_model_config[key]
         # GNN checkpoints from before bidirectional_edges existed were trained one-way;
         # resume them that way so training continues the same model
         if model_config.get("encoder_type") == "gnn":
@@ -295,6 +300,11 @@ def training_pipeline(
         )
         seed_model_state = ckpt["state_dict"]
         model_config = ckpt["model_config"]
+        for key in TRAINING_PARAM_KEYS:
+            if key in _user_model_config:
+                model_config[key] = _user_model_config[key]
+        if "scheduler_type" in _user_model_config:
+            model_config["scheduler_config"] = _user_model_config.get("scheduler_config") or {}
         print(
             f"Load model at '{seed_model_state_path}' with model config:\n {model_config}"
         )
